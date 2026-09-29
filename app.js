@@ -93,8 +93,8 @@ function appendPerfEntry(label, durationMs, detail = "") {
   };
 
   perfState.entries.push(entry);
-  if (perfState.entries.length > 24) {
-    perfState.entries.splice(0, perfState.entries.length - 24);
+  if (perfState.entries.length > 100) {
+    perfState.entries.splice(0, perfState.entries.length - 100);
   }
 
   const line = `[perf] ${label}: ${durationMs.toFixed(1)} ms${detail ? ` (${detail})` : ""}`;
@@ -127,6 +127,48 @@ if ("PerformanceObserver" in window) {
     longTaskObserver.observe({ entryTypes: ["longtask"] });
   } catch (error) {
     console.warn("Long-task performance logging unavailable:", error);
+  }
+}
+
+let previousAnimationFrameTime = null;
+let dragStartedAt = null;
+let dragEndedAt = null;
+
+function monitorFrameGaps(frameTime) {
+  if (previousAnimationFrameTime !== null) {
+    const gapMs = frameTime - previousAnimationFrameTime;
+    if (gapMs >= 80) {
+      appendPerfEntry(
+        "frame gap",
+        gapMs,
+        `z${map.getZoom()}, canvas ${canvasRenderer._container?.width ?? "?"}×${canvasRenderer._container?.height ?? "?"}`
+      );
+    }
+  }
+
+  previousAnimationFrameTime = frameTime;
+  requestAnimationFrame(monitorFrameGaps);
+}
+
+requestAnimationFrame(monitorFrameGaps);
+
+if ("PerformanceObserver" in window &&
+    PerformanceObserver.supportedEntryTypes?.includes("long-animation-frame")) {
+  try {
+    const longAnimationFrameObserver = new PerformanceObserver(list => {
+      for (const entry of list.getEntries()) {
+        const scriptDuration = (entry.scripts ?? [])
+          .reduce((total, script) => total + (script.duration ?? 0), 0);
+        appendPerfEntry(
+          "long animation frame",
+          entry.duration,
+          `scripts ${scriptDuration.toFixed(1)} ms, z${map.getZoom()}`
+        );
+      }
+    });
+    longAnimationFrameObserver.observe({ type: "long-animation-frame", buffered: false });
+  } catch (error) {
+    console.warn("Long-animation-frame logging unavailable:", error);
   }
 }
 
@@ -745,6 +787,30 @@ map.on("mousemove", scheduleHover);
 map.on("mouseout", hideHoverTooltip);
 map.on("contextmenu", showContextMenu);
 map.on("click", hideContextMenu);
+map.on("dragstart", () => {
+  dragStartedAt = performance.now();
+});
+
+map.on("dragend", () => {
+  const now = performance.now();
+  if (dragStartedAt !== null) {
+    appendPerfEntry("drag gesture", now - dragStartedAt, `z${map.getZoom()}`);
+  }
+  dragEndedAt = now;
+
+  requestAnimationFrame(() => {
+    appendPerfEntry("dragend to next frame", performance.now() - now, `z${map.getZoom()}`);
+  });
+  schedulePaintMeasurement("dragend to 2nd animation frame", now);
+});
+
+map.on("moveend", () => {
+  if (dragEndedAt !== null) {
+    appendPerfEntry("dragend to moveend", performance.now() - dragEndedAt, `z${map.getZoom()}`);
+    dragEndedAt = null;
+  }
+});
+
 map.on("movestart", () => {
   hideHoverTooltip();
   hideContextMenu();
