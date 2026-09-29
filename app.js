@@ -414,15 +414,15 @@ class WebGLTraceRenderer {
         vec3 red = vec3(0.96, 0.10, 0.05);
         vec3 orange = vec3(1.0, 0.48, 0.04);
         vec3 yellow = vec3(1.0, 0.90, 0.05);
-        vec3 magenta = vec3(1.0, 0.05, 0.65);
-        vec3 violet = vec3(0.42, 0.05, 0.95);
+        vec3 brown = vec3(0.42, 0.18, 0.03);
+        vec3 black = vec3(0.02, 0.02, 0.02);
 
         if (level < 1.0) return mix(blue, purple, level);
         if (level < 2.0) return mix(purple, red, level - 1.0);
         if (level < 3.0) return mix(red, orange, level - 2.0);
         if (level < 4.0) return mix(orange, yellow, level - 3.0);
-        if (level < 5.0) return mix(yellow, magenta, level - 4.0);
-        return mix(magenta, violet, level - 5.0);
+        if (level < 5.0) return mix(yellow, brown, level - 4.0);
+        return mix(brown, black, level - 5.0);
       }
 
       void main() {
