@@ -36,6 +36,8 @@ const state = {
   visibleBounds: null,
   visibleSegments: [],
   hoverGrid: new Map(),
+  hoverGridFrame: null,
+  hoverGridTimer: null,
   hoverTooltip: null,
   hoverFrame: null,
   pendingMouseEvent: null,
@@ -332,6 +334,33 @@ function rebuildHoverGrid() {
   );
 }
 
+function cancelScheduledHoverGridRebuild() {
+  if (state.hoverGridFrame !== null) {
+    cancelAnimationFrame(state.hoverGridFrame);
+    state.hoverGridFrame = null;
+  }
+
+  if (state.hoverGridTimer !== null) {
+    clearTimeout(state.hoverGridTimer);
+    state.hoverGridTimer = null;
+  }
+}
+
+function scheduleHoverGridRebuild() {
+  cancelScheduledHoverGridRebuild();
+  state.hoverGrid.clear();
+
+  state.hoverGridFrame = requestAnimationFrame(() => {
+    state.hoverGridFrame = requestAnimationFrame(() => {
+      state.hoverGridFrame = null;
+      state.hoverGridTimer = setTimeout(() => {
+        state.hoverGridTimer = null;
+        rebuildHoverGrid();
+      }, 0);
+    });
+  });
+}
+
 function nearestPointOnSegment(point, a, b) {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
@@ -569,7 +598,7 @@ function render() {
     recordPerf("prepare raw bounds + hover segments", stageStartedAt);
   }
 
-  rebuildHoverGrid();
+  scheduleHoverGridRebuild();
 
   state.visibleBounds = bounds.isValid() ? bounds : null;
   ui.visibleCount.textContent =
@@ -697,7 +726,9 @@ map.on("click", hideContextMenu);
 map.on("movestart", () => {
   hideHoverTooltip();
   hideContextMenu();
+  cancelScheduledHoverGridRebuild();
+  state.hoverGrid.clear();
 });
-map.on("moveend zoomend", rebuildHoverGrid);
+map.on("moveend zoomend", scheduleHoverGridRebuild);
 
 loadDefaultData();
