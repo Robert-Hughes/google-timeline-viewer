@@ -5,7 +5,7 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 }).addTo(map);
 
-const canvasRenderer = L.canvas({ padding: 0.5 });
+const canvasRenderer = L.canvas({ padding: 0.1 });
 const HOVER_RADIUS_PX = 10;
 const HOVER_GRID_SIZE_PX = 64;
 
@@ -84,8 +84,7 @@ function formatPerfMs(durationMs) {
   return `${durationMs.toFixed(1).padStart(7)} ms`;
 }
 
-function recordPerf(label, startedAt, detail = "") {
-  const durationMs = performance.now() - startedAt;
+function appendPerfEntry(label, durationMs, detail = "") {
   const entry = {
     id: ++perfState.sequence,
     label,
@@ -108,6 +107,27 @@ function recordPerf(label, startedAt, detail = "") {
   }
 
   return durationMs;
+}
+
+function recordPerf(label, startedAt, detail = "") {
+  return appendPerfEntry(label, performance.now() - startedAt, detail);
+}
+
+if ("PerformanceObserver" in window) {
+  try {
+    const longTaskObserver = new PerformanceObserver(list => {
+      for (const entry of list.getEntries()) {
+        appendPerfEntry(
+          "browser long task",
+          entry.duration,
+          `started +${entry.startTime.toFixed(1)} ms`
+        );
+      }
+    });
+    longTaskObserver.observe({ entryTypes: ["longtask"] });
+  } catch (error) {
+    console.warn("Long-task performance logging unavailable:", error);
+  }
 }
 
 function schedulePaintMeasurement(label, startedAt) {
