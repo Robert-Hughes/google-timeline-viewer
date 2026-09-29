@@ -19,6 +19,8 @@ const ui = {
   fitTraces: document.getElementById("fit-traces"),
   showPaths: document.getElementById("show-paths"),
   showRaw: document.getElementById("show-raw"),
+  overlayOpacity: document.getElementById("overlay-opacity"),
+  overlayOpacityValue: document.getElementById("overlay-opacity-value"),
   anomalyMode: document.getElementById("anomaly-mode"),
   anomalyCount: document.getElementById("anomaly-count"),
   pathCount: document.getElementById("path-count"),
@@ -310,6 +312,7 @@ class WebGLTraceRenderer {
       width: "100%",
       height: "100%",
       pointerEvents: "none",
+      opacity: String(Number(ui.overlayOpacity?.value ?? 90) / 100),
       transformOrigin: "0 0"
     });
     this.pane.appendChild(this.canvas);
@@ -1495,6 +1498,21 @@ function hideContextMenu() {
   }
 }
 
+function applyOverlayOpacity() {
+  const opacity = Number(ui.overlayOpacity.value) / 100;
+  ui.overlayOpacityValue.textContent = `${ui.overlayOpacity.value}%`;
+
+  if (state.traceRenderer) {
+    state.traceRenderer.canvas.style.opacity = String(opacity);
+  } else if (state.pathLayer) {
+    state.pathLayer.eachLayer(layer => {
+      if (typeof layer.setStyle === "function") {
+        layer.setStyle({ opacity, fillOpacity: opacity });
+      }
+    });
+  }
+}
+
 function render() {
   if (state.minTime === null) return;
 
@@ -1724,6 +1742,7 @@ for (const input of [ui.startTime, ui.endTime]) {
   });
 }
 ui.fullRange.addEventListener("click", () => setFullRange(true));
+ui.overlayOpacity.addEventListener("input", applyOverlayOpacity);
 ui.fitTraces.addEventListener("click", fitVisible);
 ui.showPaths.addEventListener("change", render);
 ui.showRaw.addEventListener("change", render);
