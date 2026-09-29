@@ -150,6 +150,43 @@ fieldset {
   height: 100%;
 }
 
+
+.trace-hover-tooltip {
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+
+.trace-tooltip-source {
+  color: #6b7280;
+  font-size: 0.8rem;
+}
+
+.map-context-menu {
+  position: absolute;
+  z-index: 1200;
+  min-width: 190px;
+  padding: 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+}
+
+.map-context-menu[hidden] {
+  display: none;
+}
+
+.map-context-coords {
+  padding: 4px 6px 6px;
+  color: #4b5563;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.map-context-menu button {
+  margin-top: 0;
+  white-space: nowrap;
+}
 @media (max-width: 760px) {
   .app {
     grid-template-columns: 1fr;

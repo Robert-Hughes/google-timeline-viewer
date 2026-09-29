@@ -6,6 +6,8 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 }).addTo(map);
 
 const canvasRenderer = L.canvas({ padding: 0.5 });
+const HOVER_RADIUS_PX = 10;
+const HOVER_GRID_SIZE_PX = 64;
 
 const ui = {
   fileInput: document.getElementById("file-input"),
@@ -30,7 +32,14 @@ const state = {
   maxTime: null,
   pathLayer: null,
   rawLayer: null,
-  visibleBounds: null
+  visibleBounds: null,
+  visibleSegments: [],
+  hoverGrid: new Map(),
+  hoverTooltip: null,
+  hoverFrame: null,
+  pendingMouseEvent: null,
+  contextMenu: null,
+  contextLatLng: null
 };
 
 function parseLatLng(value) {
@@ -143,7 +152,7 @@ function buildRawTraces(points, start, end) {
       current = [];
     }
 
-    current.push(point.latLng);
+    current.push(point);
     previous = point;
   }
 
@@ -161,13 +170,17 @@ function filteredTimelinePaths(start, end) {
     visibleCount += visible.length;
 
     if (visible.length >= 2) {
-      traces.push(visible.map(point => point.latLng));
+      traces.push(visible);
     } else if (visible.length === 1) {
-      singletonPoints.push(visible[0].latLng);
+      singletonPoints.push(visible[0]);
     }
   }
 
   return { traces, singletonPoints, visibleCount };
+}
+
+function pointsToLatLngs(traces) {
+  return traces.map(trace => trace.map(point => point.latLng));
 }
 
 function removeLayers() {
@@ -183,17 +196,18 @@ function removeLayers() {
 
 function createPathLayer(traces, singletonPoints) {
   const group = L.layerGroup();
+  const latLngTraces = pointsToLatLngs(traces);
 
-  if (traces.length) {
-    L.polyline(traces, {
+  if (latLngTraces.length) {
+    L.polyline(latLngTraces, {
       renderer: canvasRenderer,
       weight: 3,
       opacity: 0.75
     }).addTo(group);
   }
 
-  for (const latLng of singletonPoints) {
-    L.circleMarker(latLng, {
+  for (const point of singletonPoints) {
+    L.circleMarker(point.latLng, {
       renderer: canvasRenderer,
       radius: 2,
       weight: 0,
@@ -205,7 +219,7 @@ function createPathLayer(traces, singletonPoints) {
 }
 
 function createRawLayer(traces) {
-  return L.polyline(traces, {
+  return L.polyline(pointsToLatLngs(traces), {
     renderer: canvasRenderer,
     weight: 2,
     opacity: 0.55,
@@ -220,6 +234,230 @@ function addBounds(bounds, latLngs) {
     } else {
       bounds.extend(item);
     }
+  }
+}
+
+function appendTraceSegments(target, traces, source) {
+  for (const trace of traces) {
+    for (let i = 1; i < trace.length; i += 1) {
+      target.push({
+        a: trace[i - 1],
+        b: trace[i],
+        source
+      });
+    }
+  }
+}
+
+function hoverGridKey(x, y) {
+  return `${x},${y}`;
+}
+
+function rebuildHoverGrid() {
+  state.hoverGrid.clear();
+
+  for (const segment of state.visibleSegments) {
+    const a = map.latLngToLayerPoint(segment.a.latLng);
+    const b = map.latLngToLayerPoint(segment.b.latLng);
+    segment.screenA = a;
+    segment.screenB = b;
+
+    const minX = Math.floor((Math.min(a.x, b.x) - HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
+    const maxX = Math.floor((Math.max(a.x, b.x) + HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
+    const minY = Math.floor((Math.min(a.y, b.y) - HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
+    const maxY = Math.floor((Math.max(a.y, b.y) + HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
+
+    for (let gx = minX; gx <= maxX; gx += 1) {
+      for (let gy = minY; gy <= maxY; gy += 1) {
+        const key = hoverGridKey(gx, gy);
+        const bucket = state.hoverGrid.get(key);
+        if (bucket) {
+          bucket.push(segment);
+        } else {
+          state.hoverGrid.set(key, [segment]);
+        }
+      }
+    }
+  }
+}
+
+function nearestPointOnSegment(point, a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSquared = dx * dx + dy * dy;
+
+  let ratio = 0;
+  if (lengthSquared > 0) {
+    ratio = ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared;
+    ratio = Math.max(0, Math.min(1, ratio));
+  }
+
+  const x = a.x + ratio * dx;
+  const y = a.y + ratio * dy;
+  const distanceSquared = (point.x - x) ** 2 + (point.y - y) ** 2;
+
+  return { ratio, x, y, distanceSquared };
+}
+
+function findNearestTracePoint(containerPoint) {
+  const layerPoint = map.containerPointToLayerPoint(containerPoint);
+  const gx = Math.floor(layerPoint.x / HOVER_GRID_SIZE_PX);
+  const gy = Math.floor(layerPoint.y / HOVER_GRID_SIZE_PX);
+  const candidates = new Set();
+
+  for (let x = gx - 1; x <= gx + 1; x += 1) {
+    for (let y = gy - 1; y <= gy + 1; y += 1) {
+      for (const segment of state.hoverGrid.get(hoverGridKey(x, y)) ?? []) {
+        candidates.add(segment);
+      }
+    }
+  }
+
+  let best = null;
+  const maxDistanceSquared = HOVER_RADIUS_PX ** 2;
+
+  for (const segment of candidates) {
+    const nearest = nearestPointOnSegment(layerPoint, segment.screenA, segment.screenB);
+    if (nearest.distanceSquared > maxDistanceSquared) continue;
+    if (best && nearest.distanceSquared >= best.distanceSquared) continue;
+
+    const latLng = map.layerPointToLatLng(L.point(nearest.x, nearest.y));
+    const time = segment.a.time + nearest.ratio * (segment.b.time - segment.a.time);
+    best = {
+      distanceSquared: nearest.distanceSquared,
+      latLng,
+      time,
+      source: segment.source
+    };
+  }
+
+  return best;
+}
+
+function ensureHoverTooltip() {
+  if (!state.hoverTooltip) {
+    state.hoverTooltip = L.tooltip({
+      direction: "top",
+      offset: [0, -8],
+      opacity: 0.95,
+      className: "trace-hover-tooltip"
+    });
+  }
+  return state.hoverTooltip;
+}
+
+function hideHoverTooltip() {
+  if (state.hoverTooltip && map.hasLayer(state.hoverTooltip)) {
+    map.removeLayer(state.hoverTooltip);
+  }
+}
+
+function formatCoordinates(latLng) {
+  return `${latLng.lat.toFixed(6)}, ${latLng.lng.toFixed(6)}`;
+}
+
+function updateHoverTooltip(event) {
+  const nearest = findNearestTracePoint(event.containerPoint);
+  if (!nearest) {
+    hideHoverTooltip();
+    return;
+  }
+
+  const tooltip = ensureHoverTooltip();
+  const sourceLabel = nearest.source === "raw" ? "Raw position trace" : "Timeline path";
+  tooltip
+    .setLatLng(nearest.latLng)
+    .setContent(
+      `<strong>${formatCoordinates(nearest.latLng)}</strong><br>` +
+      `${new Date(nearest.time).toLocaleString()}<br>` +
+      `<span class="trace-tooltip-source">${sourceLabel}</span>`
+    );
+
+  if (!map.hasLayer(tooltip)) {
+    tooltip.addTo(map);
+  }
+}
+
+function scheduleHover(event) {
+  state.pendingMouseEvent = event;
+  if (state.hoverFrame !== null) return;
+
+  state.hoverFrame = requestAnimationFrame(() => {
+    state.hoverFrame = null;
+    const pending = state.pendingMouseEvent;
+    state.pendingMouseEvent = null;
+    if (pending) updateHoverTooltip(pending);
+  });
+}
+
+function ensureContextMenu() {
+  if (state.contextMenu) return state.contextMenu;
+
+  const menu = document.createElement("div");
+  menu.className = "map-context-menu";
+  menu.hidden = true;
+
+  const coords = document.createElement("div");
+  coords.className = "map-context-coords";
+
+  const copyButton = document.createElement("button");
+  copyButton.type = "button";
+  copyButton.textContent = "Copy GPS coordinates";
+  copyButton.addEventListener("click", async () => {
+    if (!state.contextLatLng) return;
+    const text = formatCoordinates(state.contextLatLng);
+
+    try {
+      await navigator.clipboard.writeText(text);
+      copyButton.textContent = "Copied";
+    } catch {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.setAttribute("readonly", "");
+      input.style.position = "absolute";
+      input.style.left = "-9999px";
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand("copy");
+      input.remove();
+      copyButton.textContent = "Copied";
+    }
+
+    setTimeout(hideContextMenu, 500);
+  });
+
+  menu.append(coords, copyButton);
+  map.getContainer().appendChild(menu);
+  L.DomEvent.disableClickPropagation(menu);
+  L.DomEvent.disableScrollPropagation(menu);
+
+  state.contextMenu = menu;
+  return menu;
+}
+
+function showContextMenu(event) {
+  hideHoverTooltip();
+  const menu = ensureContextMenu();
+  state.contextLatLng = event.latlng;
+
+  menu.querySelector(".map-context-coords").textContent = formatCoordinates(event.latlng);
+  const copyButton = menu.querySelector("button");
+  copyButton.textContent = "Copy GPS coordinates";
+  menu.hidden = false;
+
+  const container = map.getContainer();
+  const menuWidth = menu.offsetWidth;
+  const menuHeight = menu.offsetHeight;
+  const x = Math.min(event.containerPoint.x, container.clientWidth - menuWidth - 8);
+  const y = Math.min(event.containerPoint.y, container.clientHeight - menuHeight - 8);
+
+  menu.style.left = `${Math.max(8, x)}px`;
+  menu.style.top = `${Math.max(8, y)}px`;
+}
+
+function hideContextMenu() {
+  if (state.contextMenu) {
+    state.contextMenu.hidden = true;
   }
 }
 
@@ -239,21 +477,29 @@ function render() {
   }
 
   removeLayers();
+  hideHoverTooltip();
+  hideContextMenu();
 
   const pathResult = filteredTimelinePaths(start, end);
   const rawResult = buildRawTraces(state.rawPoints, start, end);
   const bounds = L.latLngBounds([]);
+  state.visibleSegments = [];
 
   if (ui.showPaths.checked) {
     state.pathLayer = createPathLayer(pathResult.traces, pathResult.singletonPoints).addTo(map);
-    addBounds(bounds, pathResult.traces);
-    addBounds(bounds, pathResult.singletonPoints);
+    const pathLatLngs = pointsToLatLngs(pathResult.traces);
+    addBounds(bounds, pathLatLngs);
+    addBounds(bounds, pathResult.singletonPoints.map(point => point.latLng));
+    appendTraceSegments(state.visibleSegments, pathResult.traces, "timeline");
   }
 
   if (ui.showRaw.checked && rawResult.traces.length) {
     state.rawLayer = createRawLayer(rawResult.traces).addTo(map);
-    addBounds(bounds, rawResult.traces);
+    addBounds(bounds, pointsToLatLngs(rawResult.traces));
+    appendTraceSegments(state.visibleSegments, rawResult.traces, "raw");
   }
+
+  rebuildHoverGrid();
 
   state.visibleBounds = bounds.isValid() ? bounds : null;
   ui.visibleCount.textContent =
@@ -341,5 +587,15 @@ ui.fullRange.addEventListener("click", () => setFullRange(true));
 ui.fitTraces.addEventListener("click", fitVisible);
 ui.showPaths.addEventListener("change", render);
 ui.showRaw.addEventListener("change", render);
+
+map.on("mousemove", scheduleHover);
+map.on("mouseout", hideHoverTooltip);
+map.on("contextmenu", showContextMenu);
+map.on("click", hideContextMenu);
+map.on("movestart", () => {
+  hideHoverTooltip();
+  hideContextMenu();
+});
+map.on("moveend zoomend", rebuildHoverGrid);
 
 loadDefaultData();
