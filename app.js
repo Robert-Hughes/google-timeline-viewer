@@ -408,18 +408,25 @@ class WebGLTraceRenderer {
       out vec4 out_color;
 
       vec3 heatColour(float density) {
-        float heat = clamp(log2(max(density, 1.0)) / 4.0, 0.0, 1.0);
+        float level = clamp(log2(max(density, 1.0)), 0.0, 6.0);
         vec3 blue = vec3(0.08, 0.38, 1.0);
+        vec3 purple = vec3(0.47, 0.18, 0.72);
         vec3 red = vec3(0.96, 0.10, 0.05);
+        vec3 orange = vec3(1.0, 0.48, 0.04);
         vec3 yellow = vec3(1.0, 0.90, 0.05);
-        if (heat < 0.5) {
-          return mix(blue, red, heat * 2.0);
-        }
-        return mix(red, yellow, (heat - 0.5) * 2.0);
+        vec3 cream = vec3(1.0, 0.97, 0.58);
+        vec3 white = vec3(1.0);
+
+        if (level < 1.0) return mix(blue, purple, level);
+        if (level < 2.0) return mix(purple, red, level - 1.0);
+        if (level < 3.0) return mix(red, orange, level - 2.0);
+        if (level < 4.0) return mix(orange, yellow, level - 3.0);
+        if (level < 5.0) return mix(yellow, cream, level - 4.0);
+        return mix(cream, white, level - 5.0);
       }
 
       void main() {
-        float density = texture(u_density, v_uv).r * 16.0;
+        float density = texture(u_density, v_uv).r * 64.0;
         if (density < 0.5) {
           discard;
         }
@@ -639,8 +646,8 @@ class WebGLTraceRenderer {
     this.drawPixelMin = this.map.getPixelBounds().min.clone();
 
     // Pass 1: accumulate Timeline coverage into the red channel of an
-    // off-screen 8-bit texture. One traversal contributes 1/16, so the
-    // useful density range is 1..16+ without requiring float render targets.
+    // off-screen 8-bit texture. One traversal contributes 1/64, so the
+    // useful density range is 1..64+ without requiring float render targets.
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.densityFramebuffer);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0, 0, 0, 0);
@@ -652,7 +659,7 @@ class WebGLTraceRenderer {
     this.drawSegments(
       this.buffers.timeline,
       3,
-      new Float32Array([1 / 16, 0, 0, 0])
+      new Float32Array([1 / 64, 0, 0, 0])
     );
     gl.colorMask(true, true, true, true);
 
