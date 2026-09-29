@@ -13,7 +13,9 @@ const ui = {
   fileInput: document.getElementById("file-input"),
   loadDefault: document.getElementById("load-default"),
   startTime: document.getElementById("start-time"),
+  startTimeParsed: document.getElementById("start-time-parsed"),
   endTime: document.getElementById("end-time"),
+  endTimeParsed: document.getElementById("end-time-parsed"),
   applyFilter: document.getElementById("apply-filter"),
   fullRange: document.getElementById("full-range"),
   fitTraces: document.getElementById("fit-traces"),
@@ -23,6 +25,8 @@ const ui = {
   overlayOpacityValue: document.getElementById("overlay-opacity-value"),
   anomalyMode: document.getElementById("anomaly-mode"),
   anomalyCount: document.getElementById("anomaly-count"),
+  stitchMode: document.getElementById("stitch-mode"),
+  stitchCount: document.getElementById("stitch-count"),
   pathCount: document.getElementById("path-count"),
   rawCount: document.getElementById("raw-count"),
   visibleCount: document.getElementById("visible-count"),
@@ -33,6 +37,7 @@ const ui = {
 const state = {
   timelinePaths: [],
   rawPoints: [],
+  inferredStitches: [],
   anomalyCases: [],
   anomalyLegCount: 0,
   minTime: null,
@@ -80,7 +85,7 @@ function formatFilterInput(timestamp) {
 }
 
 function parseFilterDateTime(value, endOfDay = false) {
-  const text = String(value ?? "").trim();
+  let text = String(value ?? "").trim();
   if (!text) return null;
 
   const monthNames = {
@@ -95,21 +100,57 @@ function parseFilterDateTime(value, endOfDay = false) {
     return year < 70 ? 2000 + year : 1900 + year;
   }
 
-  function parseClock(raw) {
-    if (!raw || !raw.trim()) {
-      return endOfDay
+  function parseClock(raw, useEndOfDayDefault = endOfDay) {
+    let clockText = String(raw ?? "").trim().toLowerCase();
+    if (!clockText) {
+      return useEndOfDayDefault
         ? { hour: 23, minute: 59, second: 59, millisecond: 999 }
         : { hour: 0, minute: 0, second: 0, millisecond: 0 };
     }
 
-    const match = raw.trim().match(/^(\d{1,2})(?::(\d{1,2}))?(?::(\d{1,2}))?(?:\.(\d{1,3}))?\s*(am|pm)?$/i);
+    clockText = clockText
+      .replace(/\b(?:at|time)\b/g, " ")
+      .replace(/(?:hours?|hrs?)\b/g, "")
+      .replace(/a\.m\./g, "am")
+      .replace(/p\.m\./g, "pm")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (clockText === "noon") {
+      return { hour: 12, minute: 0, second: 0, millisecond: 0 };
+    }
+    if (clockText === "midnight") {
+      return { hour: 0, minute: 0, second: 0, millisecond: 0 };
+    }
+
+    const spacedClock = clockText.match(/^(\d{1,2})\s+(\d{2})(?:\s+(\d{2}))?\s*(am|pm)?$/);
+    if (spacedClock) {
+      clockText = `${spacedClock[1]}:${spacedClock[2]}` +
+        (spacedClock[3] ? `:${spacedClock[3]}` : "") +
+        (spacedClock[4] ?? "");
+    }
+
+    const compact = clockText.match(/^(\d{2})(\d{2})(\d{2})?$/);
+    if (compact) {
+      const hour = Number(compact[1]);
+      const minute = Number(compact[2]);
+      const second = Number(compact[3] ?? 0);
+      if (hour <= 23 && minute <= 59 && second <= 59) {
+        return { hour, minute, second, millisecond: 0 };
+      }
+      return null;
+    }
+
+    const match = clockText.match(
+      /^(\d{1,2})(?:(?::|\.|h|\s+)(\d{1,2}))?(?:(?::|\.|h|\s+)(\d{1,2}))?(?:\.(\d{1,3}))?\s*(am|pm)?$/
+    );
     if (!match) return null;
 
     let hour = Number(match[1]);
     const minute = Number(match[2] ?? 0);
     const second = Number(match[3] ?? 0);
     const millisecond = Number((match[4] ?? "0").padEnd(3, "0"));
-    const meridiem = match[5]?.toLowerCase();
+    const meridiem = match[5];
 
     if (meridiem) {
       if (hour < 1 || hour > 12) return null;
@@ -121,12 +162,13 @@ function parseFilterDateTime(value, endOfDay = false) {
     return { hour, minute, second, millisecond };
   }
 
-  function makeLocal(year, month, day, clockText) {
-    const clock = parseClock(clockText);
+  function makeLocal(year, month, day, clockText, defaultEnd = endOfDay) {
+    const resolvedYear = fullYear(Number(year));
+    const clock = parseClock(clockText, defaultEnd);
     if (!clock || month < 0 || month > 11 || day < 1 || day > 31) return null;
 
     const date = new Date(
-      fullYear(Number(year)),
+      resolvedYear,
       month,
       Number(day),
       clock.hour,
@@ -135,7 +177,7 @@ function parseFilterDateTime(value, endOfDay = false) {
       clock.millisecond
     );
 
-    if (date.getFullYear() !== fullYear(Number(year)) ||
+    if (date.getFullYear() !== resolvedYear ||
         date.getMonth() !== month ||
         date.getDate() !== Number(day)) {
       return null;
@@ -143,47 +185,171 @@ function parseFilterDateTime(value, endOfDay = false) {
     return date.getTime();
   }
 
-  const relative = text.match(/^(today|yesterday|tomorrow)(?:\s+(.+))?$/i);
+  function leftoverClock(match) {
+    const before = text.slice(0, match.index);
+    const after = text.slice(match.index + match[0].length);
+    return (before + " " + after)
+      .replace(/^[\s,;@-]+|[\s,;@-]+$/g, "")
+      .replace(/^t\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  if (/^now$/i.test(text)) return Date.now();
+
+  // Preserve ISO/RFC strings with an explicit timezone exactly as written.
+  if (/(?:z|[+-]\d{2}:?\d{2})$/i.test(text)) {
+    const explicitZone = Date.parse(text);
+    if (Number.isFinite(explicitZone)) return explicitZone;
+  }
+
+  text = text
+    .replace(/(\d{1,2})(?:st|nd|rd|th)\b/gi, "$1")
+    .replace(/\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b,?/gi, " ")
+    .replace(/\b(?:on)\b/gi, " ")
+    .replace(/,/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const relative = text.match(/\b(today|yesterday|tomorrow)\b/i);
   if (relative) {
     const base = new Date();
     base.setHours(0, 0, 0, 0);
-    if (relative[1].toLowerCase() === "yesterday") base.setDate(base.getDate() - 1);
-    if (relative[1].toLowerCase() === "tomorrow") base.setDate(base.getDate() + 1);
-    const clock = parseClock(relative[2] ?? "");
+    const name = relative[1].toLowerCase();
+    if (name === "yesterday") base.setDate(base.getDate() - 1);
+    if (name === "tomorrow") base.setDate(base.getDate() + 1);
+
+    const clockText = leftoverClock(relative);
+    const clock = parseClock(clockText, endOfDay);
     if (!clock) return null;
     base.setHours(clock.hour, clock.minute, clock.second, clock.millisecond);
     return base.getTime();
   }
 
-  if (/^now$/i.test(text)) return Date.now();
+  const datePatterns = [
+    {
+      re: /\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/i,
+      parts: match => [match[1], Number(match[2]) - 1, match[3]]
+    },
+    {
+      re: /\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})\b/i,
+      parts: match => [match[3], Number(match[2]) - 1, match[1]]
+    },
+    {
+      re: /\b(\d{1,2})(?:\s*[-/]\s*|\s+)([a-z]+)(?:\s*[-/]\s*|\s+)(\d{2,4})\b/i,
+      parts: match => {
+        const month = monthNames[match[2].toLowerCase()];
+        return month === undefined ? null : [match[3], month, match[1]];
+      }
+    },
+    {
+      re: /\b([a-z]+)(?:\s*[-/]\s*|\s+)(\d{1,2})(?:\s*[-/]\s*|\s+)(\d{2,4})\b/i,
+      parts: match => {
+        const month = monthNames[match[1].toLowerCase()];
+        return month === undefined ? null : [match[3], month, match[2]];
+      }
+    },
+    {
+      re: /\b(\d{4})(?:\s*[-/]\s*|\s+)([a-z]+)(?:\s*[-/]\s*|\s+)(\d{1,2})\b/i,
+      parts: match => {
+        const month = monthNames[match[2].toLowerCase()];
+        return month === undefined ? null : [match[1], month, match[3]];
+      }
+    }
+  ];
 
-  const numericYmd = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T]+(.+))?$/);
-  if (numericYmd) {
-    const parsedLocal = makeLocal(numericYmd[1], Number(numericYmd[2]) - 1, numericYmd[3], numericYmd[4]);
-    if (parsedLocal !== null) return parsedLocal;
+  for (const pattern of datePatterns) {
+    let searchStart = 0;
+    while (searchStart < text.length) {
+      const match = pattern.re.exec(text.slice(searchStart));
+      if (!match) break;
+      match.index += searchStart;
+
+      const parts = pattern.parts(match);
+      if (parts) {
+        const clockText = leftoverClock(match);
+        return makeLocal(parts[0], parts[1], parts[2], clockText);
+      }
+
+      // A word fit the date shape but was not actually a month (for example
+      // the "pm" in "10 30 pm 14 Oct 2017"). Keep scanning for the real date.
+      searchStart = match.index + 1;
+    }
   }
 
-  const numericDmy = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?:[ T]+(.+))?$/);
-  if (numericDmy) {
-    return makeLocal(numericDmy[3], Number(numericDmy[2]) - 1, numericDmy[1], numericDmy[4]);
+  // Month/year shorthand: "Oct 2017", "2017-10".
+  let monthYear = text.match(/^([a-z]+)\s+(\d{4})$/i);
+  if (monthYear) {
+    const month = monthNames[monthYear[1].toLowerCase()];
+    if (month !== undefined) {
+      const day = endOfDay ? new Date(Number(monthYear[2]), month + 1, 0).getDate() : 1;
+      return makeLocal(monthYear[2], month, day, "", endOfDay);
+    }
+  }
+  monthYear = text.match(/^(\d{4})[-/.](\d{1,2})$/);
+  if (monthYear) {
+    const month = Number(monthYear[2]) - 1;
+    if (month >= 0 && month <= 11) {
+      const day = endOfDay ? new Date(Number(monthYear[1]), month + 1, 0).getDate() : 1;
+      return makeLocal(monthYear[1], month, day, "", endOfDay);
+    }
   }
 
-  const dayMonthName = text.match(/^(\d{1,2})\s+([a-z]+)\s+(\d{2,4})(?:\s+(.+))?$/i);
-  if (dayMonthName) {
-    const month = monthNames[dayMonthName[2].toLowerCase()];
-    if (month !== undefined) return makeLocal(dayMonthName[3], month, dayMonthName[1], dayMonthName[4]);
+  // Four bare digits are ambiguous. Treat plausible contemporary years as
+  // years; otherwise prefer HHMM when it forms a valid time (e.g. "2200").
+  if (/^\d{4}$/.test(text)) {
+    const number = Number(text);
+    const latestLikelyYear = new Date().getFullYear() + 10;
+    if (number >= 1900 && number <= latestLikelyYear) {
+      return makeLocal(text, endOfDay ? 11 : 0, endOfDay ? 31 : 1, "", endOfDay);
+    }
   }
 
-  const monthNameDay = text.replace(/,/g, "").match(/^([a-z]+)\s+(\d{1,2})\s+(\d{2,4})(?:\s+(.+))?$/i);
-  if (monthNameDay) {
-    const month = monthNames[monthNameDay[1].toLowerCase()];
-    if (month !== undefined) return makeLocal(monthNameDay[3], month, monthNameDay[2], monthNameDay[4]);
+  // A bare time is interpreted as today.
+  const clockOnly = parseClock(text, false);
+  if (clockOnly) {
+    const today = new Date();
+    today.setHours(clockOnly.hour, clockOnly.minute, clockOnly.second, clockOnly.millisecond);
+    return today.getTime();
   }
 
-  // Preserve explicit timezone offsets/Z and other unambiguous forms understood
-  // by the browser, after handling ambiguous numeric dates as UK day/month/year.
+  // Last-resort browser parsing for other unambiguous textual formats.
   const parsed = Date.parse(text);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatParsedDateTime(timestamp) {
+  return new Date(timestamp).toLocaleString("en-GB", {
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short"
+  });
+}
+
+function updateDateTimeParseFeedback(input, output, endOfDay) {
+  const parsed = parseFilterDateTime(input.value, endOfDay);
+  const valid = parsed !== null;
+
+  input.classList.toggle("parse-invalid", !valid);
+  input.setAttribute("aria-invalid", valid ? "false" : "true");
+  output.classList.toggle("parse-error", !valid);
+  output.textContent = valid
+    ? `Parsed: ${formatParsedDateTime(parsed)}`
+    : "Could not parse this date/time";
+
+  return parsed;
+}
+
+function updateAllDateTimeParseFeedback() {
+  return {
+    start: updateDateTimeParseFeedback(ui.startTime, ui.startTimeParsed, false),
+    end: updateDateTimeParseFeedback(ui.endTime, ui.endTimeParsed, true)
+  };
 }
 
 function updateStatus(message) {
@@ -353,6 +519,7 @@ class WebGLTraceRenderer {
     this.buffers = {
       timeline: this.createDataBuffer(),
       anomaly: this.createDataBuffer(),
+      stitch: this.createDataBuffer(),
       raw: this.createDataBuffer(),
       points: this.createDataBuffer()
     };
@@ -572,7 +739,7 @@ class WebGLTraceRenderer {
 
   setData(segments, singletonPoints) {
     const startedAt = performance.now();
-    const counts = { timeline: 0, anomaly: 0, raw: 0 };
+    const counts = { timeline: 0, anomaly: 0, stitch: 0, raw: 0 };
     for (const segment of segments) {
       counts[segment.source] += 1;
     }
@@ -580,9 +747,10 @@ class WebGLTraceRenderer {
     const arrays = {
       timeline: new Float32Array(counts.timeline * 4),
       anomaly: new Float32Array(counts.anomaly * 4),
+      stitch: new Float32Array(counts.stitch * 4),
       raw: new Float32Array(counts.raw * 4)
     };
-    const offsets = { timeline: 0, anomaly: 0, raw: 0 };
+    const offsets = { timeline: 0, anomaly: 0, stitch: 0, raw: 0 };
 
     for (const segment of segments) {
       const start = this.latLngToWorld(segment.a.latLng);
@@ -605,6 +773,7 @@ class WebGLTraceRenderer {
 
     this.uploadBuffer(this.buffers.timeline, arrays.timeline, 4);
     this.uploadBuffer(this.buffers.anomaly, arrays.anomaly, 4);
+    this.uploadBuffer(this.buffers.stitch, arrays.stitch, 4);
     this.uploadBuffer(this.buffers.raw, arrays.raw, 4);
     this.uploadBuffer(this.buffers.points, points, 2);
     this.requestDraw();
@@ -612,7 +781,8 @@ class WebGLTraceRenderer {
     recordPerf(
       "upload WebGL trace buffers",
       startedAt,
-      `${segments.length.toLocaleString()} segments, ${counts.anomaly.toLocaleString()} anomalous`
+      `${segments.length.toLocaleString()} segments, ${counts.anomaly.toLocaleString()} anomalous, ` +
+        `${counts.stitch.toLocaleString()} highlighted stitches`
     );
   }
 
@@ -787,6 +957,12 @@ class WebGLTraceRenderer {
       new Float32Array([0.9, 0.25, 0.15, 0.95])
     );
     this.drawSegments(
+      this.buffers.stitch,
+      3,
+      new Float32Array([1.0, 0.1, 0.65, 0.95]),
+      10
+    );
+    this.drawSegments(
       this.buffers.raw,
       2,
       new Float32Array([0.2, 0.533, 1.0, 0.55]),
@@ -905,6 +1081,11 @@ function extractTimeline(data) {
 
     if (points.length) {
       points.sort((a, b) => a.time - b.time);
+      for (let order = 0; order < points.length; order += 1) {
+        points[order].observationKind = "timeline";
+        points[order].timelinePathId = segmentIndex;
+        points[order].timelinePathOrder = order;
+      }
       timelinePaths.push(points);
     }
   }
@@ -936,12 +1117,26 @@ function extractTimeline(data) {
   }
 
   rawPoints.sort((a, b) => a.time - b.time);
+  for (let order = 0; order < rawPoints.length; order += 1) {
+    rawPoints[order].observationKind = "raw";
+    rawPoints[order].rawOrder = order;
+  }
+
+  const inferredStitches = buildInferredStitches(timelinePaths, rawPoints);
 
   if (!Number.isFinite(minTime) || !Number.isFinite(maxTime)) {
     throw new Error("No timestamped coordinates were found in this Timeline export.");
   }
 
-  return { timelinePaths, rawPoints, anomalyCases, anomalyLegCount, minTime, maxTime };
+  return {
+    timelinePaths,
+    rawPoints,
+    inferredStitches,
+    anomalyCases,
+    anomalyLegCount,
+    minTime,
+    maxTime
+  };
 }
 
 function distanceKm(a, b) {
@@ -953,6 +1148,65 @@ function distanceKm(a, b) {
   const h = Math.sin(dLat / 2) ** 2 +
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+function buildInferredStitches(timelinePaths, rawPoints) {
+  const MAX_STITCH_GAP_MS = 24 * 60 * 60_000;
+  const observations = [];
+
+  for (const path of timelinePaths) {
+    observations.push(...path);
+  }
+  observations.push(...rawPoints);
+  observations.sort((a, b) => {
+    if (a.time !== b.time) return a.time - b.time;
+    if (a.observationKind !== b.observationKind) {
+      return a.observationKind === "raw" ? -1 : 1;
+    }
+    return 0;
+  });
+
+  function explicitlyConnected(a, b) {
+    if (a.observationKind === "timeline" &&
+        b.observationKind === "timeline" &&
+        a.timelinePathId === b.timelinePathId &&
+        Math.abs(a.timelinePathOrder - b.timelinePathOrder) === 1) {
+      return true;
+    }
+
+    if (a.observationKind === "raw" &&
+        b.observationKind === "raw" &&
+        Math.abs(a.rawOrder - b.rawOrder) === 1) {
+      const gapMs = Math.abs(b.time - a.time);
+      const jumpKm = distanceKm(a.latLng, b.latLng);
+      return gapMs <= 30 * 60_000 && jumpKm <= 50;
+    }
+
+    return false;
+  }
+
+  const stitches = [];
+  for (let index = 1; index < observations.length; index += 1) {
+    const a = observations[index - 1];
+    const b = observations[index];
+    const gapMs = b.time - a.time;
+
+    if (gapMs <= 0 || gapMs > MAX_STITCH_GAP_MS) continue;
+    if (explicitlyConnected(a, b)) continue;
+
+    const stitchDistanceKm = distanceKm(a.latLng, b.latLng);
+    if (stitchDistanceKm < 0.005) continue;
+
+    stitches.push({
+      a,
+      b,
+      gapMs,
+      distanceKm: stitchDistanceKm,
+      sourceKinds: `${a.observationKind} → ${b.observationKind}`
+    });
+  }
+
+  return stitches;
 }
 
 function detectTimelineAnomalies(timelinePaths, visits) {
@@ -1200,6 +1454,28 @@ function appendTraceSegments(target, traces, source, anomalyMode = "show") {
   }
 }
 
+function appendStitchSegments(target, stitches, stitchMode) {
+  if (stitchMode === "hide") return 0;
+
+  const treatAsNormal = stitchMode === "normal";
+  let count = 0;
+
+  for (const stitch of stitches) {
+    target.push({
+      a: stitch.a,
+      b: stitch.b,
+      source: treatAsNormal ? "timeline" : "stitch",
+      anomaly: null,
+      stitch: treatAsNormal ? null : stitch,
+      detectedAnomaly: false,
+      detectedStitch: true
+    });
+    count += 1;
+  }
+
+  return count;
+}
+
 function hoverGridKey(x, y) {
   return `${x},${y}`;
 }
@@ -1357,7 +1633,8 @@ function findNearestTracePoint(containerPoint) {
       latLng,
       time,
       source: segment.source,
-      anomaly: segment.anomaly
+      anomaly: segment.anomaly,
+      stitch: segment.stitch
     };
   }
 
@@ -1398,16 +1675,21 @@ function updateHoverTooltip(event) {
     ? "Raw position trace"
     : nearest.source === "anomaly"
       ? "Potentially anomalous Timeline leg"
-      : "Timeline path";
+      : nearest.source === "stitch"
+        ? "Inferred stitch"
+        : "Timeline path";
   const anomalyDetail = nearest.anomaly
     ? `<br><span class="trace-tooltip-source">${nearest.anomaly.reason}</span>`
+    : "";
+  const stitchDetail = nearest.stitch
+    ? `<br><span class="trace-tooltip-source">${nearest.stitch.sourceKinds}, ${(nearest.stitch.gapMs / 60_000).toFixed(1)} min gap, ${nearest.stitch.distanceKm.toFixed(1)} km straight-line</span>`
     : "";
   tooltip
     .setLatLng(nearest.latLng)
     .setContent(
       `<strong>${formatCoordinates(nearest.latLng)}</strong><br>` +
       `${new Date(nearest.time).toLocaleString()}<br>` +
-      `<span class="trace-tooltip-source">${sourceLabel}</span>${anomalyDetail}`
+      `<span class="trace-tooltip-source">${sourceLabel}</span>${anomalyDetail}${stitchDetail}`
     );
 
   if (!map.hasLayer(tooltip)) {
@@ -1517,9 +1799,11 @@ function render() {
   if (state.minTime === null) return;
 
   const renderStartedAt = performance.now();
-  const start = parseFilterDateTime(ui.startTime.value, false);
-  const end = parseFilterDateTime(ui.endTime.value, true);
+  const parsedRange = updateAllDateTimeParseFeedback();
+  const start = parsedRange.start;
+  const end = parsedRange.end;
   const anomalyMode = ui.anomalyMode.value;
+  const stitchMode = ui.stitchMode.value;
 
   if (start === null || end === null) {
     updateStatus("Could not parse the start or end date/time.");
@@ -1547,16 +1831,32 @@ function render() {
   const bounds = L.latLngBounds([]);
   state.visibleSegments = [];
 
-  if (ui.showPaths.checked) {
+  const anomalyOnly = anomalyMode === "only";
+  const stitchOnly = stitchMode === "only";
+  const visibleStitches = state.inferredStitches.filter(
+    stitch => stitch.a.time >= start && stitch.b.time <= end
+  );
+
+  if (ui.showPaths.checked && (!stitchOnly || anomalyOnly)) {
     stageStartedAt = performance.now();
     appendTraceSegments(state.visibleSegments, pathResult.traces, "timeline", anomalyMode);
     recordPerf("prepare timeline hover segments", stageStartedAt);
   }
 
-  if (anomalyMode !== "only" && ui.showRaw.checked && rawResult.traces.length) {
+  if (!anomalyOnly && !stitchOnly && ui.showRaw.checked && rawResult.traces.length) {
     stageStartedAt = performance.now();
     appendTraceSegments(state.visibleSegments, rawResult.traces, "raw");
     recordPerf("prepare raw hover segments", stageStartedAt);
+  }
+
+  if (stitchMode !== "hide" && (!anomalyOnly || stitchOnly)) {
+    stageStartedAt = performance.now();
+    appendStitchSegments(state.visibleSegments, visibleStitches, stitchMode);
+    recordPerf(
+      "prepare inferred stitches",
+      stageStartedAt,
+      `${visibleStitches.length.toLocaleString()} stitches`
+    );
   }
 
   for (const segment of state.visibleSegments) {
@@ -1565,7 +1865,7 @@ function render() {
   }
 
   const visibleSingletonPoints =
-    ui.showPaths.checked && anomalyMode !== "only"
+    ui.showPaths.checked && !anomalyOnly && !stitchOnly
       ? pathResult.singletonPoints
       : [];
   for (const point of visibleSingletonPoints) {
@@ -1583,6 +1883,9 @@ function render() {
     const anomalyPairs = state.visibleSegments
       .filter(segment => segment.source === "anomaly")
       .map(segment => [segment.a.latLng, segment.b.latLng]);
+    const stitchPairs = state.visibleSegments
+      .filter(segment => segment.source === "stitch")
+      .map(segment => [segment.a.latLng, segment.b.latLng]);
     const rawPairs = state.visibleSegments
       .filter(segment => segment.source === "raw")
       .map(segment => [segment.a.latLng, segment.b.latLng]);
@@ -1598,6 +1901,15 @@ function render() {
         color: "#e64026"
       }).addTo(group);
     }
+    if (stitchPairs.length) {
+      L.polyline(stitchPairs, {
+        renderer: canvasRenderer,
+        weight: 3,
+        opacity: 0.95,
+        color: "#ff1aa6",
+        dashArray: "6 4"
+      }).addTo(group);
+    }
     if (rawPairs.length) {
       L.polyline(rawPairs, {
         renderer: canvasRenderer,
@@ -1609,19 +1921,32 @@ function render() {
     state.pathLayer = group.addTo(map);
   }
 
+  applyOverlayOpacity();
+
   scheduleHoverGridRebuild();
 
   state.visibleBounds = bounds.isValid() ? bounds : null;
-  ui.visibleCount.textContent =
-    (pathResult.visibleCount + (anomalyMode === "only" ? 0 : rawResult.visibleCount)).toLocaleString();
 
   const visibleAnomalyLegs = state.visibleSegments
     .filter(segment => segment.detectedAnomaly).length;
+  const visibleStitchLegs = state.visibleSegments
+    .filter(segment => segment.detectedStitch).length;
+
+  let visiblePointCount = 0;
+  if (!anomalyOnly && !stitchOnly) {
+    if (ui.showPaths.checked) visiblePointCount += pathResult.visibleCount;
+    if (ui.showRaw.checked) visiblePointCount += rawResult.visibleCount;
+  } else {
+    visiblePointCount = 2 * (visibleAnomalyLegs + visibleStitchLegs);
+  }
+  ui.visibleCount.textContent = visiblePointCount.toLocaleString();
+
   const fromText = new Date(start).toLocaleString();
   const toText = new Date(end).toLocaleString();
   updateStatus(
     `Showing ${fromText} – ${toText}. ` +
-    `${visibleAnomalyLegs.toLocaleString()} potentially anomalous legs visible.`
+    `${visibleAnomalyLegs.toLocaleString()} potentially anomalous legs and ` +
+    `${visibleStitchLegs.toLocaleString()} inferred stitches visible.`
   );
 
   recordPerf(
@@ -1641,6 +1966,7 @@ function fitVisible() {
 function setFullRange(renderNow = true) {
   ui.startTime.value = formatFilterInput(state.minTime);
   ui.endTime.value = formatFilterInput(state.maxTime);
+  updateAllDateTimeParseFeedback();
   if (renderNow) {
     render();
     fitVisible();
@@ -1661,6 +1987,7 @@ async function loadData(data, label) {
 
   state.timelinePaths = extracted.timelinePaths;
   state.rawPoints = extracted.rawPoints;
+  state.inferredStitches = extracted.inferredStitches;
   state.anomalyCases = extracted.anomalyCases;
   state.anomalyLegCount = extracted.anomalyLegCount;
   state.minTime = extracted.minTime;
@@ -1670,6 +1997,7 @@ async function loadData(data, label) {
   ui.rawCount.textContent = state.rawPoints.length.toLocaleString();
   ui.anomalyCount.textContent =
     `${state.anomalyCases.length.toLocaleString()} cases / ${state.anomalyLegCount.toLocaleString()} legs`;
+  ui.stitchCount.textContent = state.inferredStitches.length.toLocaleString();
   ui.applyFilter.disabled = false;
   ui.fullRange.disabled = false;
   ui.fitTraces.disabled = false;
@@ -1684,7 +2012,8 @@ async function loadData(data, label) {
   updateStatus(
     `Loaded ${label}. Data range: ${new Date(state.minTime).toLocaleString()} – ` +
     `${new Date(state.maxTime).toLocaleString()}. Detected ` +
-    `${state.anomalyCases.length} potential anomaly cases (${state.anomalyLegCount} legs); hidden by default.`
+    `${state.anomalyCases.length} potential anomaly cases (${state.anomalyLegCount} legs) and ` +
+    `${state.inferredStitches.length.toLocaleString()} inferred stitches; both hidden by default.`
   );
 }
 
@@ -1736,7 +2065,13 @@ ui.fileInput.addEventListener("change", async event => {
 
 ui.loadDefault.addEventListener("click", loadDefaultData);
 ui.applyFilter.addEventListener("click", render);
-for (const input of [ui.startTime, ui.endTime]) {
+for (const [input, output, endOfDay] of [
+  [ui.startTime, ui.startTimeParsed, false],
+  [ui.endTime, ui.endTimeParsed, true]
+]) {
+  input.addEventListener("input", () => {
+    updateDateTimeParseFeedback(input, output, endOfDay);
+  });
   input.addEventListener("keydown", event => {
     if (event.key === "Enter") render();
   });
@@ -1747,6 +2082,7 @@ ui.fitTraces.addEventListener("click", fitVisible);
 ui.showPaths.addEventListener("change", render);
 ui.showRaw.addEventListener("change", render);
 ui.anomalyMode.addEventListener("change", render);
+ui.stitchMode.addEventListener("change", render);
 
 map.on("mousemove", scheduleHover);
 map.on("mouseout", hideHoverTooltip);

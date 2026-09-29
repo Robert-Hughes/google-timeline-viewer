@@ -23,11 +23,13 @@
       <div class="field-row">
         <label>
           From
-          <input id="start-time" type="text" placeholder="e.g. 1 Jan 2020, 01/01/2020 09:30">
+          <input id="start-time" type="text" placeholder="e.g. 10pm Sat 14 Oct 2017">
+          <span id="start-time-parsed" class="parsed-datetime"></span>
         </label>
         <label>
           To
-          <input id="end-time" type="text" placeholder="e.g. 31 Dec 2020, 2020-12-31 18:00">
+          <input id="end-time" type="text" placeholder="e.g. Sat 14 Oct 2017 22:00">
+          <span id="end-time-parsed" class="parsed-datetime"></span>
         </label>
       </div>
 
@@ -54,6 +56,16 @@
           </select>
         </label>
         <div class="anomaly-summary"><span>Detected anomaly cases</span><strong id="anomaly-count">–</strong></div>
+        <label class="anomaly-mode">
+          Inferred stitches
+          <select id="stitch-mode">
+            <option value="hide" selected>Hide inferred stitches</option>
+            <option value="show">Show all (highlight stitches)</option>
+            <option value="normal">Show all (treat stitches as normal)</option>
+            <option value="only">Show inferred stitches only</option>
+          </select>
+        </label>
+        <div class="anomaly-summary"><span>Available inferred stitches</span><strong id="stitch-count">–</strong></div>
       </fieldset>
 
       <button id="fit-traces" type="button" disabled>Fit visible traces</button>

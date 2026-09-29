@@ -29,11 +29,12 @@ The map background uses OpenStreetMap tiles, so viewing the map requires network
 
 - `semanticSegments[].timelinePath`: rendered as Timeline traces; overlapping trace pixels accumulate into a WebGL density map using a logarithmic blue → red → yellow scale stretched across roughly one to sixty-four traversals. Single-point path segments are shown as small points.
 - `rawSignals[].position`: sorted by timestamp and joined into dashed traces when consecutive records are no more than 30 minutes and 50 km apart. Raw traces are drawn separately and do not contribute to Timeline density.
+- **Inferred stitches** are straight lines between consecutive known Timeline/raw observations when no existing trace already connects them and the gap is no more than 24 hours. They are hidden by default. The selector can highlight them, treat them exactly like normal Timeline traces (including density accumulation), or isolate only the inferred stitches.
 - Activity start/end coordinates are deliberately not connected because some records span long periods or long-distance travel and would create misleading straight lines.
-- The **Overlay opacity** slider changes the opacity of the Timeline/Raw WebGL overlay without rebuilding trace geometry.
+- The **Overlay opacity** slider changes the opacity of the Timeline/Raw/stitch WebGL overlay without rebuilding trace geometry.
 
 ## Filtering
 
-Enter **From** and **To** as ordinary text and press **Apply filter** (or Enter). Accepted forms include ISO-style dates, UK numeric dates such as `29/09/2026 14:30`, month names such as `29 Sep 2026 2:30pm`, and `today`, `yesterday`, `tomorrow`, or `now`. A date without a time means the start of that day for **From** and the end of that day for **To**. **Full range** restores the complete range found in the loaded export.
+Enter **From** and **To** as ordinary text and press **Apply filter** (or Enter). The parser accepts flexible ordering and many common forms, including `10pm Sat 14 Oct 2017`, `Sat 14 Oct 2017 10pm`, `2200 Sat 14 Oct 2017`, `22:00 Sat 14 Oct 2017`, ISO-style dates, UK numeric dates such as `14/10/2017 22:00`, month-name dates, `today`, `yesterday`, `tomorrow`, `now`, `noon`, and `midnight`. Weekday names and ordinal suffixes are tolerated, compact HHMM times are accepted, and a bare time is interpreted as today. A date without a time means the start of that day for **From** and the end of that day for **To**. The parsed interpretation is displayed underneath each input; failed parsing is shown with a red outline. **Full range** restores the complete range found in the loaded export.
 
 Dates without an explicit timezone are interpreted in the browser's local timezone. Timeline timestamps themselves are parsed from the offsets stored in the Google export.
