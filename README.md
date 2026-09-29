@@ -29,8 +29,9 @@ The map background uses OpenStreetMap tiles, so viewing the map requires network
 
 - `semanticSegments[].timelinePath`: rendered as Timeline traces; overlapping trace pixels accumulate into a WebGL density map using a logarithmic blue → red → yellow scale stretched across roughly one to sixty-four traversals. Single-point path segments are shown as small points.
 - `rawSignals[].position`: sorted by timestamp and joined into dashed traces when consecutive records are no more than 30 minutes and 50 km apart. Raw traces are drawn separately and do not contribute to Timeline density.
-- **Inferred stitches** are straight lines between consecutive known Timeline/raw observations when no existing trace already connects them and the gap is no more than 24 hours. They are hidden by default. The selector can highlight them, treat them exactly like normal Timeline traces (including density accumulation), or isolate only the inferred stitches.
-- Activity start/end coordinates are deliberately not connected because some records span long periods or long-distance travel and would create misleading straight lines.
+- **Inferred stitches** connect consecutive known Timeline/raw observations when no existing trace already connects them and the gap is no more than 24 hours. They are hidden by default. The selector can highlight them, treat them exactly like normal Timeline traces (including density accumulation), or isolate only the inferred stitches.
+- Any displayed leg longer than 100 km (Google Timeline or inferred stitch) is rendered along the shortest great-circle route, tessellated into chords of at most roughly 100 km. This is derived display/hover geometry only; the source observations and logical leg counts are unchanged.
+- Activity start/end coordinates are deliberately not connected because some records span long periods or long-distance travel and would create misleading direct connections.
 - The **Overlay opacity** slider changes the opacity of the Timeline/Raw/stitch WebGL overlay without rebuilding trace geometry.
 
 ## Filtering

@@ -8,6 +8,8 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 const canvasRenderer = L.canvas({ padding: 0.1 });
 const HOVER_RADIUS_PX = 10;
 const HOVER_WORLD_GRID_SIZE = 0.25; // zoom-0 projected pixels; fixed across all zoom levels
+const GREAT_CIRCLE_THRESHOLD_KM = 100;
+const GREAT_CIRCLE_MAX_CHORD_KM = 100;
 
 const ui = {
   fileInput: document.getElementById("file-input"),
@@ -47,6 +49,7 @@ const state = {
   traceRenderer: null,
   visibleBounds: null,
   visibleSegments: [],
+  renderSegments: [],
   hoverGrid: new Map(),
   hoverGridFrame: null,
   hoverGridTimer: null,
@@ -1149,6 +1152,81 @@ function distanceKm(a, b) {
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
+function interpolateGreatCircle(a, b, fraction) {
+  const toRad = value => value * Math.PI / 180;
+  const toDeg = value => value * 180 / Math.PI;
+  const lat1 = toRad(a[0]);
+  const lng1 = toRad(a[1]);
+  const lat2 = toRad(b[0]);
+  const lng2 = toRad(b[1]);
+  const centralAngle = distanceKm(a, b) / 6371;
+
+  if (centralAngle < 1e-12) return [a[0], a[1]];
+
+  const sinAngle = Math.sin(centralAngle);
+  if (Math.abs(sinAngle) < 1e-12) {
+    const lngDelta = ((b[1] - a[1] + 540) % 360) - 180;
+    return [
+      a[0] + (b[0] - a[0]) * fraction,
+      a[1] + lngDelta * fraction
+    ];
+  }
+
+  const startWeight = Math.sin((1 - fraction) * centralAngle) / sinAngle;
+  const endWeight = Math.sin(fraction * centralAngle) / sinAngle;
+
+  const x = startWeight * Math.cos(lat1) * Math.cos(lng1) +
+    endWeight * Math.cos(lat2) * Math.cos(lng2);
+  const y = startWeight * Math.cos(lat1) * Math.sin(lng1) +
+    endWeight * Math.cos(lat2) * Math.sin(lng2);
+  const z = startWeight * Math.sin(lat1) + endWeight * Math.sin(lat2);
+
+  return [
+    toDeg(Math.atan2(z, Math.sqrt(x * x + y * y))),
+    toDeg(Math.atan2(y, x))
+  ];
+}
+
+function expandSegmentForRendering(segment) {
+  const segmentDistanceKm = distanceKm(segment.a.latLng, segment.b.latLng);
+  if (segmentDistanceKm <= GREAT_CIRCLE_THRESHOLD_KM) return [segment];
+
+  const pieceCount = Math.ceil(segmentDistanceKm / GREAT_CIRCLE_MAX_CHORD_KM);
+  const pieces = [];
+  for (let index = 0; index < pieceCount; index += 1) {
+    const startFraction = index / pieceCount;
+    const endFraction = (index + 1) / pieceCount;
+    const startLatLng = startFraction === 0
+      ? segment.a.latLng
+      : interpolateGreatCircle(segment.a.latLng, segment.b.latLng, startFraction);
+    const endLatLng = endFraction === 1
+      ? segment.b.latLng
+      : interpolateGreatCircle(segment.a.latLng, segment.b.latLng, endFraction);
+
+    pieces.push({
+      ...segment,
+      a: {
+        ...segment.a,
+        latLng: startLatLng,
+        time: segment.a.time + (segment.b.time - segment.a.time) * startFraction
+      },
+      b: {
+        ...segment.b,
+        latLng: endLatLng,
+        time: segment.a.time + (segment.b.time - segment.a.time) * endFraction
+      }
+    });
+  }
+  return pieces;
+}
+
+function expandSegmentsForRendering(segments) {
+  const expanded = [];
+  for (const segment of segments) {
+    expanded.push(...expandSegmentForRendering(segment));
+  }
+  return expanded;
+}
 
 function buildInferredStitches(timelinePaths, rawPoints) {
   const MAX_STITCH_GAP_MS = 24 * 60 * 60_000;
@@ -1498,7 +1576,7 @@ function rebuildHoverGrid() {
     insertions += 1;
   }
 
-  for (const segment of state.visibleSegments) {
+  for (const segment of state.renderSegments) {
     const a = map.project(segment.a.latLng, 0);
     const b = map.project(segment.b.latLng, 0);
     segment.hoverA = a;
@@ -1550,7 +1628,7 @@ function rebuildHoverGrid() {
   recordPerf(
     "hover world index",
     startedAt,
-    `${state.visibleSegments.length.toLocaleString()} segments, ` +
+    `${state.renderSegments.length.toLocaleString()} render segments, ` +
       `${insertions.toLocaleString()} insertions, ` +
       `${state.hoverGrid.size.toLocaleString()} cells, max ${maxCellsPerSegment}/segment`
   );
@@ -1859,7 +1937,15 @@ function render() {
     );
   }
 
-  for (const segment of state.visibleSegments) {
+  stageStartedAt = performance.now();
+  state.renderSegments = expandSegmentsForRendering(state.visibleSegments);
+  recordPerf(
+    "prepare great-circle render geometry",
+    stageStartedAt,
+    `${state.visibleSegments.length.toLocaleString()} logical → ${state.renderSegments.length.toLocaleString()} render segments`
+  );
+
+  for (const segment of state.renderSegments) {
     bounds.extend(segment.a.latLng);
     bounds.extend(segment.b.latLng);
   }
@@ -1874,19 +1960,19 @@ function render() {
 
   const traceRenderer = getTraceRenderer();
   if (traceRenderer) {
-    traceRenderer.setData(state.visibleSegments, visibleSingletonPoints);
+    traceRenderer.setData(state.renderSegments, visibleSingletonPoints);
   } else {
     const group = L.layerGroup();
-    const normalPairs = state.visibleSegments
+    const normalPairs = state.renderSegments
       .filter(segment => segment.source === "timeline")
       .map(segment => [segment.a.latLng, segment.b.latLng]);
-    const anomalyPairs = state.visibleSegments
+    const anomalyPairs = state.renderSegments
       .filter(segment => segment.source === "anomaly")
       .map(segment => [segment.a.latLng, segment.b.latLng]);
-    const stitchPairs = state.visibleSegments
+    const stitchPairs = state.renderSegments
       .filter(segment => segment.source === "stitch")
       .map(segment => [segment.a.latLng, segment.b.latLng]);
-    const rawPairs = state.visibleSegments
+    const rawPairs = state.renderSegments
       .filter(segment => segment.source === "raw")
       .map(segment => [segment.a.latLng, segment.b.latLng]);
 
