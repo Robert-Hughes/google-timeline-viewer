@@ -247,6 +247,7 @@ class WebGLTraceRenderer {
     };
 
     this.drawQueued = false;
+    this.drawFrame = null;
     this.requestDraw = this.requestDraw.bind(this);
     this.handleZoomAnimation = this.handleZoomAnimation.bind(this);
     this.handleZoomEnd = this.handleZoomEnd.bind(this);
@@ -626,6 +627,8 @@ class WebGLTraceRenderer {
   }
   draw() {
     this.drawQueued = false;
+    if (this.map._animatingZoom) return;
+
     const gl = this.gl;
     this.canvas.style.transform = "";
     this.resizeCanvas();
@@ -680,6 +683,11 @@ class WebGLTraceRenderer {
   }
 
   handleZoomAnimation(event) {
+    if (this.drawFrame !== null) {
+      cancelAnimationFrame(this.drawFrame);
+      this.drawFrame = null;
+      this.drawQueued = false;
+    }
     if (this.drawZoom === undefined || !this.drawCenter) return;
 
     const scale = this.map.getZoomScale(event.zoom, this.drawZoom);
@@ -694,13 +702,35 @@ class WebGLTraceRenderer {
 
   handleZoomEnd() {
     this.canvas.style.transform = "";
-    this.requestDraw();
+
+    if (this.drawFrame !== null) {
+      cancelAnimationFrame(this.drawFrame);
+    }
+    this.drawQueued = true;
+
+    const drawAfterZoom = () => {
+      if (this.map._animatingZoom) {
+        this.drawFrame = requestAnimationFrame(drawAfterZoom);
+        return;
+      }
+
+      this.drawFrame = null;
+      this.drawQueued = false;
+      this.draw();
+    };
+
+    this.drawFrame = requestAnimationFrame(drawAfterZoom);
   }
 
   requestDraw() {
     if (this.map._animatingZoom || this.drawQueued) return;
     this.drawQueued = true;
-    requestAnimationFrame(() => this.draw());
+    this.drawFrame = requestAnimationFrame(() => {
+      this.drawFrame = null;
+      this.drawQueued = false;
+      if (this.map._animatingZoom) return;
+      this.draw();
+    });
   }
 }
 
