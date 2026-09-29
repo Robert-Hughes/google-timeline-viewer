@@ -7,7 +7,7 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 
 const canvasRenderer = L.canvas({ padding: 0.1 });
 const HOVER_RADIUS_PX = 10;
-const HOVER_GRID_SIZE_PX = 64;
+const HOVER_WORLD_GRID_SIZE = 0.25; // zoom-0 projected pixels; fixed across all zoom levels
 
 const ui = {
   fileInput: document.getElementById("file-input"),
@@ -1094,37 +1094,77 @@ function hoverGridKey(x, y) {
 
 function rebuildHoverGrid() {
   const startedAt = performance.now();
-  const zoom = map.getZoom();
   state.hoverGrid.clear();
 
+  let insertions = 0;
+  let maxCellsPerSegment = 0;
+
+  function addToCell(gx, gy, segment) {
+    const key = hoverGridKey(gx, gy);
+    const bucket = state.hoverGrid.get(key);
+    if (bucket) {
+      bucket.push(segment);
+    } else {
+      state.hoverGrid.set(key, [segment]);
+    }
+    insertions += 1;
+  }
+
   for (const segment of state.visibleSegments) {
-    const a = map.project(segment.a.latLng, zoom);
-    const b = map.project(segment.b.latLng, zoom);
-    segment.screenA = a;
-    segment.screenB = b;
+    const a = map.project(segment.a.latLng, 0);
+    const b = map.project(segment.b.latLng, 0);
+    segment.hoverA = a;
+    segment.hoverB = b;
 
-    const minX = Math.floor((Math.min(a.x, b.x) - HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
-    const maxX = Math.floor((Math.max(a.x, b.x) + HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
-    const minY = Math.floor((Math.min(a.y, b.y) - HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
-    const maxY = Math.floor((Math.max(a.y, b.y) + HOVER_RADIUS_PX) / HOVER_GRID_SIZE_PX);
+    let gx = Math.floor(a.x / HOVER_WORLD_GRID_SIZE);
+    let gy = Math.floor(a.y / HOVER_WORLD_GRID_SIZE);
+    const endGx = Math.floor(b.x / HOVER_WORLD_GRID_SIZE);
+    const endGy = Math.floor(b.y / HOVER_WORLD_GRID_SIZE);
 
-    for (let gx = minX; gx <= maxX; gx += 1) {
-      for (let gy = minY; gy <= maxY; gy += 1) {
-        const key = hoverGridKey(gx, gy);
-        const bucket = state.hoverGrid.get(key);
-        if (bucket) {
-          bucket.push(segment);
-        } else {
-          state.hoverGrid.set(key, [segment]);
-        }
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const stepX = Math.sign(dx);
+    const stepY = Math.sign(dy);
+    const tDeltaX = dx === 0 ? Infinity : HOVER_WORLD_GRID_SIZE / Math.abs(dx);
+    const tDeltaY = dy === 0 ? Infinity : HOVER_WORLD_GRID_SIZE / Math.abs(dy);
+
+    let tMaxX = dx === 0
+      ? Infinity
+      : (((stepX > 0 ? gx + 1 : gx) * HOVER_WORLD_GRID_SIZE) - a.x) / dx;
+    let tMaxY = dy === 0
+      ? Infinity
+      : (((stepY > 0 ? gy + 1 : gy) * HOVER_WORLD_GRID_SIZE) - a.y) / dy;
+
+    let cellsForSegment = 0;
+    while (true) {
+      addToCell(gx, gy, segment);
+      cellsForSegment += 1;
+
+      if (gx === endGx && gy === endGy) break;
+
+      if (tMaxX < tMaxY) {
+        gx += stepX;
+        tMaxX += tDeltaX;
+      } else if (tMaxY < tMaxX) {
+        gy += stepY;
+        tMaxY += tDeltaY;
+      } else {
+        gx += stepX;
+        gy += stepY;
+        tMaxX += tDeltaX;
+        tMaxY += tDeltaY;
       }
     }
+
+    maxCellsPerSegment = Math.max(maxCellsPerSegment, cellsForSegment);
   }
 
   recordPerf(
-    "hover grid",
+    "hover world index",
     startedAt,
-    `${state.visibleSegments.length.toLocaleString()} segments, ${state.hoverGrid.size.toLocaleString()} cells, z${zoom}`
+    `${state.visibleSegments.length.toLocaleString()} segments, ` +
+      `${insertions.toLocaleString()} insertions, ` +
+      `${state.hoverGrid.size.toLocaleString()} cells, max ${maxCellsPerSegment}/segment`
   );
 }
 
@@ -1175,13 +1215,15 @@ function nearestPointOnSegment(point, a, b) {
 
 function findNearestTracePoint(containerPoint) {
   const zoom = map.getZoom();
-  const worldPoint = map.project(map.containerPointToLatLng(containerPoint), zoom);
-  const gx = Math.floor(worldPoint.x / HOVER_GRID_SIZE_PX);
-  const gy = Math.floor(worldPoint.y / HOVER_GRID_SIZE_PX);
+  const worldPoint = map.project(map.containerPointToLatLng(containerPoint), 0);
+  const gx = Math.floor(worldPoint.x / HOVER_WORLD_GRID_SIZE);
+  const gy = Math.floor(worldPoint.y / HOVER_WORLD_GRID_SIZE);
+  const hoverRadiusWorld = HOVER_RADIUS_PX / Math.pow(2, zoom);
+  const cellRadius = Math.ceil(hoverRadiusWorld / HOVER_WORLD_GRID_SIZE) + 1;
   const candidates = new Set();
 
-  for (let x = gx - 1; x <= gx + 1; x += 1) {
-    for (let y = gy - 1; y <= gy + 1; y += 1) {
+  for (let x = gx - cellRadius; x <= gx + cellRadius; x += 1) {
+    for (let y = gy - cellRadius; y <= gy + cellRadius; y += 1) {
       for (const segment of state.hoverGrid.get(hoverGridKey(x, y)) ?? []) {
         candidates.add(segment);
       }
@@ -1189,14 +1231,14 @@ function findNearestTracePoint(containerPoint) {
   }
 
   let best = null;
-  const maxDistanceSquared = HOVER_RADIUS_PX ** 2;
+  const maxDistanceSquared = hoverRadiusWorld ** 2;
 
   for (const segment of candidates) {
-    const nearest = nearestPointOnSegment(worldPoint, segment.screenA, segment.screenB);
+    const nearest = nearestPointOnSegment(worldPoint, segment.hoverA, segment.hoverB);
     if (nearest.distanceSquared > maxDistanceSquared) continue;
     if (best && nearest.distanceSquared >= best.distanceSquared) continue;
 
-    const latLng = map.unproject(L.point(nearest.x, nearest.y), zoom);
+    const latLng = map.unproject(L.point(nearest.x, nearest.y), 0);
     const time = segment.a.time + nearest.ratio * (segment.b.time - segment.a.time);
     best = {
       distanceSquared: nearest.distanceSquared,
@@ -1605,10 +1647,5 @@ map.on("movestart", () => {
   hideHoverTooltip();
   hideContextMenu();
 });
-map.on("zoomstart", () => {
-  cancelScheduledHoverGridRebuild();
-  state.hoverGrid.clear();
-});
-map.on("zoomend", scheduleHoverGridRebuild);
 
 loadDefaultData();
