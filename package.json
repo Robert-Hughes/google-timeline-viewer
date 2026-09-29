@@ -1,0 +1,9 @@
+{
+  "name": "google-timeline-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Leaflet viewer for Google Maps Timeline exports",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
