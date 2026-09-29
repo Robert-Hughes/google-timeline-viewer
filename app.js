@@ -185,17 +185,22 @@ function schedulePaintMeasurement(label, startedAt) {
 class WebGLTraceRenderer {
   constructor(mapInstance) {
     this.map = mapInstance;
+    this.pane = this.map.getPane("tracePane") || this.map.createPane("tracePane");
+    this.pane.style.zIndex = "450";
+    this.pane.style.pointerEvents = "none";
+
     this.canvas = document.createElement("canvas");
-    this.canvas.className = "trace-webgl-layer";
+    this.canvas.className = "trace-webgl-layer leaflet-zoom-animated";
     Object.assign(this.canvas.style, {
       position: "absolute",
-      inset: "0",
+      left: "0",
+      top: "0",
       width: "100%",
       height: "100%",
       pointerEvents: "none",
-      zIndex: "400"
+      transformOrigin: "0 0"
     });
-    this.map.getContainer().appendChild(this.canvas);
+    this.pane.appendChild(this.canvas);
 
     const gl = this.canvas.getContext("webgl2", {
       alpha: true,
@@ -233,7 +238,11 @@ class WebGLTraceRenderer {
 
     this.drawQueued = false;
     this.requestDraw = this.requestDraw.bind(this);
-    this.map.on("move zoom resize", this.requestDraw);
+    this.handleZoomAnimation = this.handleZoomAnimation.bind(this);
+    this.handleZoomEnd = this.handleZoomEnd.bind(this);
+    this.map.on("move resize", this.requestDraw);
+    this.map.on("zoomanim", this.handleZoomAnimation);
+    this.map.on("zoomend", this.handleZoomEnd);
 
     this.canvas.addEventListener("webglcontextlost", event => {
       event.preventDefault();
@@ -448,11 +457,17 @@ class WebGLTraceRenderer {
     const dpr = window.devicePixelRatio || 1;
     const width = Math.max(1, Math.round(size.x * dpr));
     const height = Math.max(1, Math.round(size.y * dpr));
+    const mapPanePosition = L.DomUtil.getPosition(this.map._mapPane) || L.point(0, 0);
 
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
     }
+
+    this.canvas.style.width = `${size.x}px`;
+    this.canvas.style.height = `${size.y}px`;
+    this.canvas.style.left = `${-mapPanePosition.x}px`;
+    this.canvas.style.top = `${-mapPanePosition.y}px`;
 
     return { size, dpr };
   }
@@ -511,7 +526,12 @@ class WebGLTraceRenderer {
   draw() {
     this.drawQueued = false;
     const gl = this.gl;
+    this.canvas.style.transform = "";
     this.resizeCanvas();
+
+    this.drawZoom = this.map.getZoom();
+    this.drawCenter = this.map.getCenter();
+
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -530,8 +550,26 @@ class WebGLTraceRenderer {
     this.drawPoints(this.buffers.points);
   }
 
+  handleZoomAnimation(event) {
+    if (this.drawZoom === undefined || !this.drawCenter) return;
+
+    const scale = this.map.getZoomScale(event.zoom, this.drawZoom);
+    const halfSize = this.map.getSize().multiplyBy(0.5);
+    const projectedCenter = this.map.project(this.drawCenter, event.zoom);
+    const newPixelOrigin = this.map._getNewPixelOrigin(event.center, event.zoom);
+    const offset = halfSize.multiplyBy(-scale)
+      .add(projectedCenter)
+      .subtract(newPixelOrigin);
+    L.DomUtil.setTransform(this.canvas, offset, scale);
+  }
+
+  handleZoomEnd() {
+    this.canvas.style.transform = "";
+    this.requestDraw();
+  }
+
   requestDraw() {
-    if (this.drawQueued) return;
+    if (this.map._animatingZoom || this.drawQueued) return;
     this.drawQueued = true;
     requestAnimationFrame(() => this.draw());
   }
