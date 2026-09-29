@@ -8,7 +8,7 @@ It displays timestamped Timeline path data and raw location positions over OpenS
 
 The repository intentionally does not commit personal Timeline data.
 
-1. Put an export at `data/Timeline.json` (already done in this local checkout), or use the file picker in the UI.
+1. Put an export at `data/Timeline.json`, or use the file picker in the UI.
 2. Run:
 
    ```powershell
