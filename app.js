@@ -636,6 +636,7 @@ class WebGLTraceRenderer {
 
     this.drawZoom = this.map.getZoom();
     this.drawCenter = this.map.getCenter();
+    this.drawPixelMin = this.map.getPixelBounds().min.clone();
 
     // Pass 1: accumulate Timeline coverage into the red channel of an
     // off-screen 8-bit texture. One traversal contributes 1/16, so the
@@ -688,15 +689,13 @@ class WebGLTraceRenderer {
       this.drawFrame = null;
       this.drawQueued = false;
     }
-    if (this.drawZoom === undefined || !this.drawCenter) return;
+    if (this.drawZoom === undefined || !this.drawPixelMin) return;
 
     const scale = this.map.getZoomScale(event.zoom, this.drawZoom);
-    const halfSize = this.map.getSize().multiplyBy(0.5);
-    const projectedCenter = this.map.project(this.drawCenter, event.zoom);
-    const newPixelOrigin = this.map._getNewPixelOrigin(event.center, event.zoom);
-    const offset = halfSize.multiplyBy(-scale)
-      .add(projectedCenter)
-      .subtract(newPixelOrigin);
+    const mapPanePosition = L.DomUtil.getPosition(this.map._mapPane) || L.point(0, 0);
+    const targetPixelMin = this.map._getNewPixelOrigin(event.center, event.zoom)
+      .subtract(mapPanePosition);
+    const offset = this.drawPixelMin.multiplyBy(scale).subtract(targetPixelMin);
     L.DomUtil.setTransform(this.canvas, offset, scale);
   }
 
