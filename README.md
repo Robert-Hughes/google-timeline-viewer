@@ -27,8 +27,8 @@ The map background uses OpenStreetMap tiles, so viewing the map requires network
 
 ## What is rendered
 
-- `semanticSegments[].timelinePath`: rendered as Timeline traces; single-point path segments are shown as small points.
-- `rawSignals[].position`: sorted by timestamp and joined into dashed traces when consecutive records are no more than 30 minutes and 50 km apart.
+- `semanticSegments[].timelinePath`: rendered as Timeline traces; overlapping trace pixels accumulate into a WebGL density map (blue for one traversal, red around four, yellow around sixteen or more). Single-point path segments are shown as small points.
+- `rawSignals[].position`: sorted by timestamp and joined into dashed traces when consecutive records are no more than 30 minutes and 50 km apart. Raw traces are drawn separately and do not contribute to Timeline density.
 - Activity start/end coordinates are deliberately not connected because some records span long periods or long-distance travel and would create misleading straight lines.
 
 ## Filtering

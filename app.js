@@ -219,6 +219,11 @@ class WebGLTraceRenderer {
     this.gl = gl;
     this.segmentProgram = this.createSegmentProgram();
     this.pointProgram = this.createPointProgram();
+    this.heatmapProgram = this.createHeatmapProgram();
+    this.densityTexture = gl.createTexture();
+    this.densityFramebuffer = gl.createFramebuffer();
+    this.densityWidth = 0;
+    this.densityHeight = 0;
     this.cornerBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
     gl.bufferData(
@@ -379,6 +384,53 @@ class WebGLTraceRenderer {
       color: gl.getUniformLocation(program, "u_color")
     };
   }
+  createHeatmapProgram() {
+    const gl = this.gl;
+    const program = this.createProgram(
+      `#version 300 es
+      out vec2 v_uv;
+
+      void main() {
+        vec2 positions[3] = vec2[3](
+          vec2(-1.0, -1.0),
+          vec2(3.0, -1.0),
+          vec2(-1.0, 3.0)
+        );
+        vec2 position = positions[gl_VertexID];
+        v_uv = position * 0.5 + 0.5;
+        gl_Position = vec4(position, 0.0, 1.0);
+      }`,
+      `#version 300 es
+      precision highp float;
+      uniform sampler2D u_density;
+      in vec2 v_uv;
+      out vec4 out_color;
+
+      vec3 heatColour(float density) {
+        float heat = clamp(log2(max(density, 1.0)) / 4.0, 0.0, 1.0);
+        vec3 blue = vec3(0.08, 0.38, 1.0);
+        vec3 red = vec3(0.96, 0.10, 0.05);
+        vec3 yellow = vec3(1.0, 0.90, 0.05);
+        if (heat < 0.5) {
+          return mix(blue, red, heat * 2.0);
+        }
+        return mix(red, yellow, (heat - 0.5) * 2.0);
+      }
+
+      void main() {
+        float density = texture(u_density, v_uv).r * 16.0;
+        if (density < 0.5) {
+          discard;
+        }
+        out_color = vec4(heatColour(density), 0.90);
+      }`
+    );
+
+    return {
+      program,
+      density: gl.getUniformLocation(program, "u_density")
+    };
+  }
 
   createDataBuffer() {
     return {
@@ -470,6 +522,47 @@ class WebGLTraceRenderer {
 
     return { size, dpr };
   }
+  resizeDensityTarget() {
+    const gl = this.gl;
+    const width = this.canvas.width;
+    const height = this.canvas.height;
+    if (width === this.densityWidth && height === this.densityHeight) return;
+
+    this.densityWidth = width;
+    this.densityHeight = height;
+
+    gl.bindTexture(gl.TEXTURE_2D, this.densityTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA8,
+      width,
+      height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      null
+    );
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.densityFramebuffer);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      this.densityTexture,
+      0
+    );
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error(`Density framebuffer is incomplete (0x${status.toString(16)}).`);
+    }
+  }
 
   setCommonUniforms(programInfo, size) {
     const gl = this.gl;
@@ -522,24 +615,56 @@ class WebGLTraceRenderer {
     gl.drawArrays(gl.POINTS, 0, bufferInfo.count);
   }
 
+  drawHeatmap() {
+    const gl = this.gl;
+    const info = this.heatmapProgram;
+    gl.useProgram(info.program);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.densityTexture);
+    gl.uniform1i(info.density, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
   draw() {
     this.drawQueued = false;
     const gl = this.gl;
     this.canvas.style.transform = "";
     this.resizeCanvas();
+    this.resizeDensityTarget();
 
     this.drawZoom = this.map.getZoom();
     this.drawCenter = this.map.getCenter();
 
+    // Pass 1: accumulate Timeline coverage into the red channel of an
+    // off-screen 8-bit texture. One traversal contributes 1/16, so the
+    // useful density range is 1..16+ without requiring float render targets.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.densityFramebuffer);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
-
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.colorMask(true, false, false, false);
     this.drawSegments(
       this.buffers.timeline,
       3,
-      new Float32Array([0.2, 0.533, 1.0, 0.75])
+      new Float32Array([1 / 16, 0, 0, 0])
     );
+    gl.colorMask(true, true, true, true);
+
+    // Pass 2: map accumulated density to blue -> red -> yellow, then draw
+    // diagnostic/auxiliary layers normally on top.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.blendFuncSeparate(
+      gl.SRC_ALPHA,
+      gl.ONE_MINUS_SRC_ALPHA,
+      gl.ONE,
+      gl.ONE_MINUS_SRC_ALPHA
+    );
+    this.drawHeatmap();
     this.drawSegments(
       this.buffers.anomaly,
       4,
