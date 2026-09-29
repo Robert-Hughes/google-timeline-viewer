@@ -922,11 +922,13 @@ function appendTraceSegments(target, traces, source, anomalyMode = "show") {
       if (source === "timeline" && anomalyMode === "hide" && isAnomaly) continue;
       if (source === "timeline" && anomalyMode === "only" && !isAnomaly) continue;
 
+      const treatAsNormal = isAnomaly && anomalyMode === "normal";
       target.push({
         a: trace[i - 1],
         b: trace[i],
-        source: isAnomaly ? "anomaly" : source,
-        anomaly: isAnomaly ? anomalies[0] : null
+        source: isAnomaly && !treatAsNormal ? "anomaly" : source,
+        anomaly: isAnomaly && !treatAsNormal ? anomalies[0] : null,
+        detectedAnomaly: isAnomaly
       });
     }
   }
@@ -1291,7 +1293,7 @@ function render() {
     (pathResult.visibleCount + (anomalyMode === "only" ? 0 : rawResult.visibleCount)).toLocaleString();
 
   const visibleAnomalyLegs = state.visibleSegments
-    .filter(segment => segment.source === "anomaly").length;
+    .filter(segment => segment.detectedAnomaly).length;
   const fromText = new Date(start).toLocaleString();
   const toText = new Date(end).toLocaleString();
   updateStatus(
