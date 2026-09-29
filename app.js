@@ -301,11 +301,12 @@ function hoverGridKey(x, y) {
 
 function rebuildHoverGrid() {
   const startedAt = performance.now();
+  const zoom = map.getZoom();
   state.hoverGrid.clear();
 
   for (const segment of state.visibleSegments) {
-    const a = map.latLngToLayerPoint(segment.a.latLng);
-    const b = map.latLngToLayerPoint(segment.b.latLng);
+    const a = map.project(segment.a.latLng, zoom);
+    const b = map.project(segment.b.latLng, zoom);
     segment.screenA = a;
     segment.screenB = b;
 
@@ -330,7 +331,7 @@ function rebuildHoverGrid() {
   recordPerf(
     "hover grid",
     startedAt,
-    `${state.visibleSegments.length.toLocaleString()} segments, ${state.hoverGrid.size.toLocaleString()} cells`
+    `${state.visibleSegments.length.toLocaleString()} segments, ${state.hoverGrid.size.toLocaleString()} cells, z${zoom}`
   );
 }
 
@@ -380,9 +381,10 @@ function nearestPointOnSegment(point, a, b) {
 }
 
 function findNearestTracePoint(containerPoint) {
-  const layerPoint = map.containerPointToLayerPoint(containerPoint);
-  const gx = Math.floor(layerPoint.x / HOVER_GRID_SIZE_PX);
-  const gy = Math.floor(layerPoint.y / HOVER_GRID_SIZE_PX);
+  const zoom = map.getZoom();
+  const worldPoint = map.project(map.containerPointToLatLng(containerPoint), zoom);
+  const gx = Math.floor(worldPoint.x / HOVER_GRID_SIZE_PX);
+  const gy = Math.floor(worldPoint.y / HOVER_GRID_SIZE_PX);
   const candidates = new Set();
 
   for (let x = gx - 1; x <= gx + 1; x += 1) {
@@ -397,11 +399,11 @@ function findNearestTracePoint(containerPoint) {
   const maxDistanceSquared = HOVER_RADIUS_PX ** 2;
 
   for (const segment of candidates) {
-    const nearest = nearestPointOnSegment(layerPoint, segment.screenA, segment.screenB);
+    const nearest = nearestPointOnSegment(worldPoint, segment.screenA, segment.screenB);
     if (nearest.distanceSquared > maxDistanceSquared) continue;
     if (best && nearest.distanceSquared >= best.distanceSquared) continue;
 
-    const latLng = map.layerPointToLatLng(L.point(nearest.x, nearest.y));
+    const latLng = map.unproject(L.point(nearest.x, nearest.y), zoom);
     const time = segment.a.time + nearest.ratio * (segment.b.time - segment.a.time);
     best = {
       distanceSquared: nearest.distanceSquared,
@@ -726,9 +728,11 @@ map.on("click", hideContextMenu);
 map.on("movestart", () => {
   hideHoverTooltip();
   hideContextMenu();
+});
+map.on("zoomstart", () => {
   cancelScheduledHoverGridRebuild();
   state.hoverGrid.clear();
 });
-map.on("moveend zoomend", scheduleHoverGridRebuild);
+map.on("zoomend", scheduleHoverGridRebuild);
 
 loadDefaultData();
