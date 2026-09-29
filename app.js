@@ -33,6 +33,7 @@ const state = {
   maxTime: null,
   pathLayer: null,
   rawLayer: null,
+  traceRenderer: null,
   visibleBounds: null,
   visibleSegments: [],
   hoverGrid: new Map(),
@@ -138,10 +139,11 @@ function monitorFrameGaps(frameTime) {
   if (previousAnimationFrameTime !== null) {
     const gapMs = frameTime - previousAnimationFrameTime;
     if (gapMs >= 80) {
+      const traceCanvas = state.traceRenderer?.canvas ?? canvasRenderer._container;
       appendPerfEntry(
         "frame gap",
         gapMs,
-        `z${map.getZoom()}, canvas ${canvasRenderer._container?.width ?? "?"}×${canvasRenderer._container?.height ?? "?"}`
+        `z${map.getZoom()}, surface ${traceCanvas?.width ?? "?"}×${traceCanvas?.height ?? "?"}`
       );
     }
   }
@@ -178,6 +180,373 @@ function schedulePaintMeasurement(label, startedAt) {
       recordPerf(label, startedAt);
     });
   });
+}
+
+class WebGLTraceRenderer {
+  constructor(mapInstance) {
+    this.map = mapInstance;
+    this.canvas = document.createElement("canvas");
+    this.canvas.className = "trace-webgl-layer";
+    Object.assign(this.canvas.style, {
+      position: "absolute",
+      inset: "0",
+      width: "100%",
+      height: "100%",
+      pointerEvents: "none",
+      zIndex: "400"
+    });
+    this.map.getContainer().appendChild(this.canvas);
+
+    const gl = this.canvas.getContext("webgl2", {
+      alpha: true,
+      antialias: true,
+      premultipliedAlpha: true
+    });
+    if (!gl) {
+      this.canvas.remove();
+      throw new Error("WebGL2 is unavailable.");
+    }
+
+    this.gl = gl;
+    this.segmentProgram = this.createSegmentProgram();
+    this.pointProgram = this.createPointProgram();
+    this.cornerBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([
+        0, -1,
+        1, -1,
+        1, 1,
+        0, -1,
+        1, 1,
+        0, 1
+      ]),
+      gl.STATIC_DRAW
+    );
+
+    this.buffers = {
+      timeline: this.createDataBuffer(),
+      raw: this.createDataBuffer(),
+      points: this.createDataBuffer()
+    };
+
+    this.drawQueued = false;
+    this.requestDraw = this.requestDraw.bind(this);
+    this.map.on("move zoom resize", this.requestDraw);
+
+    this.canvas.addEventListener("webglcontextlost", event => {
+      event.preventDefault();
+      updateStatus("WebGL context lost; refresh the page to restore trace rendering.");
+    });
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  createShader(type, source) {
+    const gl = this.gl;
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || "WebGL shader compilation failed.");
+    }
+    return shader;
+  }
+
+  createProgram(vertexSource, fragmentSource) {
+    const gl = this.gl;
+    const program = gl.createProgram();
+    gl.attachShader(program, this.createShader(gl.VERTEX_SHADER, vertexSource));
+    gl.attachShader(program, this.createShader(gl.FRAGMENT_SHADER, fragmentSource));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || "WebGL program linking failed.");
+    }
+    return program;
+  }
+
+  createSegmentProgram() {
+    const gl = this.gl;
+    const program = this.createProgram(
+      `#version 300 es
+      in vec4 a_segment;
+      in vec2 a_corner;
+      uniform float u_world_size;
+      uniform vec2 u_pixel_min;
+      uniform vec2 u_view_size;
+      uniform float u_half_width;
+      out float v_distance_px;
+
+      void main() {
+        vec2 p0 = a_segment.xy * u_world_size - u_pixel_min;
+        vec2 p1 = a_segment.zw * u_world_size - u_pixel_min;
+        vec2 delta = p1 - p0;
+        float segment_length = max(length(delta), 0.0001);
+        vec2 normal = vec2(-delta.y, delta.x) / segment_length;
+        vec2 point = mix(p0, p1, a_corner.x) + normal * a_corner.y * u_half_width;
+        vec2 clip = vec2(
+          point.x / u_view_size.x * 2.0 - 1.0,
+          1.0 - point.y / u_view_size.y * 2.0
+        );
+        gl_Position = vec4(clip, 0.0, 1.0);
+        v_distance_px = a_corner.x * segment_length;
+      }`,
+      `#version 300 es
+      precision mediump float;
+      uniform vec4 u_color;
+      uniform float u_dash_period;
+      in float v_distance_px;
+      out vec4 out_color;
+
+      void main() {
+        if (u_dash_period > 0.0 &&
+            mod(v_distance_px, u_dash_period) >= u_dash_period * 0.5) {
+          discard;
+        }
+        out_color = u_color;
+      }`
+    );
+
+    return {
+      program,
+      segment: gl.getAttribLocation(program, "a_segment"),
+      corner: gl.getAttribLocation(program, "a_corner"),
+      worldSize: gl.getUniformLocation(program, "u_world_size"),
+      pixelMin: gl.getUniformLocation(program, "u_pixel_min"),
+      viewSize: gl.getUniformLocation(program, "u_view_size"),
+      halfWidth: gl.getUniformLocation(program, "u_half_width"),
+      color: gl.getUniformLocation(program, "u_color"),
+      dashPeriod: gl.getUniformLocation(program, "u_dash_period")
+    };
+  }
+
+  createPointProgram() {
+    const gl = this.gl;
+    const program = this.createProgram(
+      `#version 300 es
+      in vec2 a_world;
+      uniform float u_world_size;
+      uniform vec2 u_pixel_min;
+      uniform vec2 u_view_size;
+      uniform float u_point_size;
+
+      void main() {
+        vec2 point = a_world * u_world_size - u_pixel_min;
+        vec2 clip = vec2(
+          point.x / u_view_size.x * 2.0 - 1.0,
+          1.0 - point.y / u_view_size.y * 2.0
+        );
+        gl_Position = vec4(clip, 0.0, 1.0);
+        gl_PointSize = u_point_size;
+      }`,
+      `#version 300 es
+      precision mediump float;
+      uniform vec4 u_color;
+      out vec4 out_color;
+
+      void main() {
+        vec2 centered = gl_PointCoord * 2.0 - 1.0;
+        if (dot(centered, centered) > 1.0) {
+          discard;
+        }
+        out_color = u_color;
+      }`
+    );
+
+    return {
+      program,
+      world: gl.getAttribLocation(program, "a_world"),
+      worldSize: gl.getUniformLocation(program, "u_world_size"),
+      pixelMin: gl.getUniformLocation(program, "u_pixel_min"),
+      viewSize: gl.getUniformLocation(program, "u_view_size"),
+      pointSize: gl.getUniformLocation(program, "u_point_size"),
+      color: gl.getUniformLocation(program, "u_color")
+    };
+  }
+
+  createDataBuffer() {
+    return {
+      buffer: this.gl.createBuffer(),
+      count: 0
+    };
+  }
+
+  latLngToWorld(latLng) {
+    const lat = Array.isArray(latLng) ? latLng[0] : latLng.lat;
+    const lng = Array.isArray(latLng) ? latLng[1] : latLng.lng;
+    const limitedLat = Math.max(-85.05112878, Math.min(85.05112878, lat));
+    const sinLat = Math.sin(limitedLat * Math.PI / 180);
+    return [
+      (lng + 180) / 360,
+      0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)
+    ];
+  }
+
+  uploadBuffer(target, values, componentsPerVertex) {
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, target.buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW);
+    target.count = values.length / componentsPerVertex;
+  }
+
+  setData(segments, singletonPoints) {
+    const startedAt = performance.now();
+    let timelineCount = 0;
+    let rawCount = 0;
+    for (const segment of segments) {
+      if (segment.source === "raw") {
+        rawCount += 1;
+      } else {
+        timelineCount += 1;
+      }
+    }
+
+    const timeline = new Float32Array(timelineCount * 4);
+    const raw = new Float32Array(rawCount * 4);
+    let timelineOffset = 0;
+    let rawOffset = 0;
+
+    for (const segment of segments) {
+      const start = this.latLngToWorld(segment.a.latLng);
+      const end = this.latLngToWorld(segment.b.latLng);
+      const target = segment.source === "raw" ? raw : timeline;
+      const offset = segment.source === "raw" ? rawOffset : timelineOffset;
+      target[offset] = start[0];
+      target[offset + 1] = start[1];
+      target[offset + 2] = end[0];
+      target[offset + 3] = end[1];
+      if (segment.source === "raw") {
+        rawOffset += 4;
+      } else {
+        timelineOffset += 4;
+      }
+    }
+
+    const points = new Float32Array(singletonPoints.length * 2);
+    for (let index = 0; index < singletonPoints.length; index += 1) {
+      const world = this.latLngToWorld(singletonPoints[index].latLng);
+      points[index * 2] = world[0];
+      points[index * 2 + 1] = world[1];
+    }
+
+    this.uploadBuffer(this.buffers.timeline, timeline, 4);
+    this.uploadBuffer(this.buffers.raw, raw, 4);
+    this.uploadBuffer(this.buffers.points, points, 2);
+    this.requestDraw();
+
+    recordPerf(
+      "upload WebGL trace buffers",
+      startedAt,
+      `${segments.length.toLocaleString()} segments, ${singletonPoints.length.toLocaleString()} points`
+    );
+  }
+
+  resizeCanvas() {
+    const size = this.map.getSize();
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(1, Math.round(size.x * dpr));
+    const height = Math.max(1, Math.round(size.y * dpr));
+
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+    }
+
+    return { size, dpr };
+  }
+
+  setCommonUniforms(programInfo, size) {
+    const gl = this.gl;
+    const zoom = this.map.getZoom();
+    const pixelBounds = this.map.getPixelBounds();
+    gl.uniform1f(programInfo.worldSize, 256 * Math.pow(2, zoom));
+    gl.uniform2f(programInfo.pixelMin, pixelBounds.min.x, pixelBounds.min.y);
+    gl.uniform2f(programInfo.viewSize, size.x, size.y);
+  }
+
+  drawSegments(bufferInfo, width, color, dashPeriod = 0) {
+    if (!bufferInfo.count) return;
+
+    const gl = this.gl;
+    const info = this.segmentProgram;
+    gl.useProgram(info.program);
+    this.setCommonUniforms(info, this.map.getSize());
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufferInfo.buffer);
+    gl.enableVertexAttribArray(info.segment);
+    gl.vertexAttribPointer(info.segment, 4, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(info.segment, 1);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuffer);
+    gl.enableVertexAttribArray(info.corner);
+    gl.vertexAttribPointer(info.corner, 2, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(info.corner, 0);
+
+    gl.uniform1f(info.halfWidth, width / 2);
+    gl.uniform4fv(info.color, color);
+    gl.uniform1f(info.dashPeriod, dashPeriod);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, bufferInfo.count);
+  }
+
+  drawPoints(bufferInfo) {
+    if (!bufferInfo.count) return;
+
+    const gl = this.gl;
+    const info = this.pointProgram;
+    gl.useProgram(info.program);
+    this.setCommonUniforms(info, this.map.getSize());
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufferInfo.buffer);
+    gl.enableVertexAttribArray(info.world);
+    gl.vertexAttribPointer(info.world, 2, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(info.world, 0);
+
+    gl.uniform1f(info.pointSize, 4);
+    gl.uniform4fv(info.color, new Float32Array([0.2, 0.533, 1.0, 0.75]));
+    gl.drawArrays(gl.POINTS, 0, bufferInfo.count);
+  }
+
+  draw() {
+    this.drawQueued = false;
+    const gl = this.gl;
+    this.resizeCanvas();
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    this.drawSegments(
+      this.buffers.timeline,
+      3,
+      new Float32Array([0.2, 0.533, 1.0, 0.75])
+    );
+    this.drawSegments(
+      this.buffers.raw,
+      2,
+      new Float32Array([0.2, 0.533, 1.0, 0.55]),
+      8
+    );
+    this.drawPoints(this.buffers.points);
+  }
+
+  requestDraw() {
+    if (this.drawQueued) return;
+    this.drawQueued = true;
+    requestAnimationFrame(() => this.draw());
+  }
+}
+
+function getTraceRenderer() {
+  if (state.traceRenderer === null) {
+    try {
+      state.traceRenderer = new WebGLTraceRenderer(map);
+    } catch (error) {
+      console.warn("WebGL trace renderer unavailable; falling back to Leaflet Canvas.", error);
+      state.traceRenderer = false;
+    }
+  }
+  return state.traceRenderer;
 }
 
 function extractTimeline(data) {
@@ -640,10 +1009,6 @@ function render() {
 
   if (ui.showPaths.checked) {
     stageStartedAt = performance.now();
-    state.pathLayer = createPathLayer(pathResult.traces, pathResult.singletonPoints).addTo(map);
-    recordPerf("create timeline Leaflet layer", stageStartedAt, `${pathResult.traces.length.toLocaleString()} traces`);
-
-    stageStartedAt = performance.now();
     const pathLatLngs = pointsToLatLngs(pathResult.traces);
     addBounds(bounds, pathLatLngs);
     addBounds(bounds, pathResult.singletonPoints.map(point => point.latLng));
@@ -653,13 +1018,28 @@ function render() {
 
   if (ui.showRaw.checked && rawResult.traces.length) {
     stageStartedAt = performance.now();
-    state.rawLayer = createRawLayer(rawResult.traces).addTo(map);
-    recordPerf("create raw Leaflet layer", stageStartedAt, `${rawResult.traces.length.toLocaleString()} traces`);
-
-    stageStartedAt = performance.now();
     addBounds(bounds, pointsToLatLngs(rawResult.traces));
     appendTraceSegments(state.visibleSegments, rawResult.traces, "raw");
     recordPerf("prepare raw bounds + hover segments", stageStartedAt);
+  }
+
+  const traceRenderer = getTraceRenderer();
+  if (traceRenderer) {
+    traceRenderer.setData(
+      state.visibleSegments,
+      ui.showPaths.checked ? pathResult.singletonPoints : []
+    );
+  } else {
+    if (ui.showPaths.checked) {
+      stageStartedAt = performance.now();
+      state.pathLayer = createPathLayer(pathResult.traces, pathResult.singletonPoints).addTo(map);
+      recordPerf("create timeline Leaflet fallback layer", stageStartedAt);
+    }
+    if (ui.showRaw.checked && rawResult.traces.length) {
+      stageStartedAt = performance.now();
+      state.rawLayer = createRawLayer(rawResult.traces).addTo(map);
+      recordPerf("create raw Leaflet fallback layer", stageStartedAt);
+    }
   }
 
   scheduleHoverGridRebuild();
