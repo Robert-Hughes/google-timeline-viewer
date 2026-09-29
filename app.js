@@ -22,7 +22,8 @@ const ui = {
   pathCount: document.getElementById("path-count"),
   rawCount: document.getElementById("raw-count"),
   visibleCount: document.getElementById("visible-count"),
-  status: document.getElementById("status")
+  status: document.getElementById("status"),
+  perfLog: document.getElementById("perf-log")
 };
 
 const state = {
@@ -70,6 +71,49 @@ function localInputValue(timestamp) {
 
 function updateStatus(message) {
   ui.status.textContent = message;
+}
+
+const perfState = {
+  entries: [],
+  sequence: 0
+};
+
+function formatPerfMs(durationMs) {
+  return `${durationMs.toFixed(1).padStart(7)} ms`;
+}
+
+function recordPerf(label, startedAt, detail = "") {
+  const durationMs = performance.now() - startedAt;
+  const entry = {
+    id: ++perfState.sequence,
+    label,
+    durationMs,
+    detail
+  };
+
+  perfState.entries.push(entry);
+  if (perfState.entries.length > 24) {
+    perfState.entries.splice(0, perfState.entries.length - 24);
+  }
+
+  const line = `[perf] ${label}: ${durationMs.toFixed(1)} ms${detail ? ` (${detail})` : ""}`;
+  console.log(line);
+
+  if (ui.perfLog) {
+    ui.perfLog.textContent = perfState.entries
+      .map(item => `${formatPerfMs(item.durationMs)}  ${item.label}${item.detail ? `  ${item.detail}` : ""}`)
+      .join("\n");
+  }
+
+  return durationMs;
+}
+
+function schedulePaintMeasurement(label, startedAt) {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      recordPerf(label, startedAt);
+    });
+  });
 }
 
 function extractTimeline(data) {
@@ -254,6 +298,7 @@ function hoverGridKey(x, y) {
 }
 
 function rebuildHoverGrid() {
+  const startedAt = performance.now();
   state.hoverGrid.clear();
 
   for (const segment of state.visibleSegments) {
@@ -279,6 +324,12 @@ function rebuildHoverGrid() {
       }
     }
   }
+
+  recordPerf(
+    "hover grid",
+    startedAt,
+    `${state.visibleSegments.length.toLocaleString()} segments, ${state.hoverGrid.size.toLocaleString()} cells`
+  );
 }
 
 function nearestPointOnSegment(point, a, b) {
@@ -464,6 +515,7 @@ function hideContextMenu() {
 function render() {
   if (state.minTime === null) return;
 
+  const renderStartedAt = performance.now();
   const start = new Date(ui.startTime.value).getTime();
   const end = new Date(ui.endTime.value).getTime();
 
@@ -476,27 +528,45 @@ function render() {
     return;
   }
 
+  let stageStartedAt = performance.now();
   removeLayers();
   hideHoverTooltip();
   hideContextMenu();
+  recordPerf("remove old layers", stageStartedAt);
 
+  stageStartedAt = performance.now();
   const pathResult = filteredTimelinePaths(start, end);
+  recordPerf("filter timeline paths", stageStartedAt, `${pathResult.visibleCount.toLocaleString()} points`);
+
+  stageStartedAt = performance.now();
   const rawResult = buildRawTraces(state.rawPoints, start, end);
+  recordPerf("build raw traces", stageStartedAt, `${rawResult.visibleCount.toLocaleString()} points`);
+
   const bounds = L.latLngBounds([]);
   state.visibleSegments = [];
 
   if (ui.showPaths.checked) {
+    stageStartedAt = performance.now();
     state.pathLayer = createPathLayer(pathResult.traces, pathResult.singletonPoints).addTo(map);
+    recordPerf("create timeline Leaflet layer", stageStartedAt, `${pathResult.traces.length.toLocaleString()} traces`);
+
+    stageStartedAt = performance.now();
     const pathLatLngs = pointsToLatLngs(pathResult.traces);
     addBounds(bounds, pathLatLngs);
     addBounds(bounds, pathResult.singletonPoints.map(point => point.latLng));
     appendTraceSegments(state.visibleSegments, pathResult.traces, "timeline");
+    recordPerf("prepare timeline bounds + hover segments", stageStartedAt);
   }
 
   if (ui.showRaw.checked && rawResult.traces.length) {
+    stageStartedAt = performance.now();
     state.rawLayer = createRawLayer(rawResult.traces).addTo(map);
+    recordPerf("create raw Leaflet layer", stageStartedAt, `${rawResult.traces.length.toLocaleString()} traces`);
+
+    stageStartedAt = performance.now();
     addBounds(bounds, pointsToLatLngs(rawResult.traces));
     appendTraceSegments(state.visibleSegments, rawResult.traces, "raw");
+    recordPerf("prepare raw bounds + hover segments", stageStartedAt);
   }
 
   rebuildHoverGrid();
@@ -508,6 +578,13 @@ function render() {
   const fromText = new Date(start).toLocaleString();
   const toText = new Date(end).toLocaleString();
   updateStatus(`Showing ${fromText} – ${toText}.`);
+
+  recordPerf(
+    "render total (sync)",
+    renderStartedAt,
+    `${state.visibleSegments.length.toLocaleString()} hover segments`
+  );
+  schedulePaintMeasurement("render to 2nd animation frame", renderStartedAt);
 }
 
 function fitVisible() {
@@ -529,7 +606,14 @@ async function loadData(data, label) {
   updateStatus(`Parsing ${label}…`);
   await new Promise(resolve => setTimeout(resolve, 0));
 
+  const extractStartedAt = performance.now();
   const extracted = extractTimeline(data);
+  recordPerf(
+    "extract Timeline data",
+    extractStartedAt,
+    `${extracted.timelinePaths.length.toLocaleString()} paths, ${extracted.rawPoints.length.toLocaleString()} raw points`
+  );
+
   state.timelinePaths = extracted.timelinePaths;
   state.rawPoints = extracted.rawPoints;
   state.minTime = extracted.minTime;
@@ -543,7 +627,10 @@ async function loadData(data, label) {
 
   setFullRange(false);
   render();
+
+  const fitStartedAt = performance.now();
   fitVisible();
+  recordPerf("fit visible traces", fitStartedAt);
 
   updateStatus(
     `Loaded ${label}. Data range: ${new Date(state.minTime).toLocaleString()} – ${new Date(state.maxTime).toLocaleString()}.`
@@ -553,13 +640,20 @@ async function loadData(data, label) {
 async function loadDefaultData() {
   try {
     updateStatus("Loading data/Timeline.json…");
+
+    let startedAt = performance.now();
     const response = await fetch("data/Timeline.json", { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
     const text = await response.text();
+    recordPerf("fetch Timeline JSON", startedAt, `${(text.length / 1_000_000).toFixed(1)} MB text`);
+
     updateStatus("Parsing data/Timeline.json…");
+    startedAt = performance.now();
     const data = JSON.parse(text);
+    recordPerf("JSON.parse", startedAt);
+
     await loadData(data, "data/Timeline.json");
   } catch (error) {
     updateStatus(
@@ -574,7 +668,15 @@ ui.fileInput.addEventListener("change", async event => {
 
   try {
     updateStatus(`Reading ${file.name}…`);
-    const data = JSON.parse(await file.text());
+
+    let startedAt = performance.now();
+    const text = await file.text();
+    recordPerf("read selected Timeline JSON", startedAt, `${(text.length / 1_000_000).toFixed(1)} MB text`);
+
+    startedAt = performance.now();
+    const data = JSON.parse(text);
+    recordPerf("JSON.parse", startedAt);
+
     await loadData(data, file.name);
   } catch (error) {
     updateStatus(`Failed to load ${file.name}: ${error.message}`);

@@ -151,6 +151,28 @@ fieldset {
 }
 
 
+
+.perf-panel {
+  margin-top: 16px;
+  font-size: 0.8rem;
+}
+
+.perf-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.perf-panel pre {
+  margin: 8px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f9fafb;
+  font: 11px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+}
 .trace-hover-tooltip {
   font-variant-numeric: tabular-nums;
   line-height: 1.35;
