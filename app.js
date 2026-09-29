@@ -70,10 +70,118 @@ function parseTime(value) {
   return Number.isFinite(time) ? time : null;
 }
 
-function localInputValue(timestamp) {
+function formatFilterInput(timestamp) {
   const date = new Date(timestamp);
-  const offsetMs = date.getTimezoneOffset() * 60_000;
-  return new Date(timestamp - offsetMs).toISOString().slice(0, 19);
+  const pad = value => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function parseFilterDateTime(value, endOfDay = false) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+
+  const monthNames = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
+    apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6,
+    aug: 7, august: 7, sep: 8, sept: 8, september: 8, oct: 9, october: 9,
+    nov: 10, november: 10, dec: 11, december: 11
+  };
+
+  function fullYear(year) {
+    if (year >= 100) return year;
+    return year < 70 ? 2000 + year : 1900 + year;
+  }
+
+  function parseClock(raw) {
+    if (!raw || !raw.trim()) {
+      return endOfDay
+        ? { hour: 23, minute: 59, second: 59, millisecond: 999 }
+        : { hour: 0, minute: 0, second: 0, millisecond: 0 };
+    }
+
+    const match = raw.trim().match(/^(\d{1,2})(?::(\d{1,2}))?(?::(\d{1,2}))?(?:\.(\d{1,3}))?\s*(am|pm)?$/i);
+    if (!match) return null;
+
+    let hour = Number(match[1]);
+    const minute = Number(match[2] ?? 0);
+    const second = Number(match[3] ?? 0);
+    const millisecond = Number((match[4] ?? "0").padEnd(3, "0"));
+    const meridiem = match[5]?.toLowerCase();
+
+    if (meridiem) {
+      if (hour < 1 || hour > 12) return null;
+      if (hour === 12) hour = 0;
+      if (meridiem === "pm") hour += 12;
+    }
+
+    if (hour > 23 || minute > 59 || second > 59) return null;
+    return { hour, minute, second, millisecond };
+  }
+
+  function makeLocal(year, month, day, clockText) {
+    const clock = parseClock(clockText);
+    if (!clock || month < 0 || month > 11 || day < 1 || day > 31) return null;
+
+    const date = new Date(
+      fullYear(Number(year)),
+      month,
+      Number(day),
+      clock.hour,
+      clock.minute,
+      clock.second,
+      clock.millisecond
+    );
+
+    if (date.getFullYear() !== fullYear(Number(year)) ||
+        date.getMonth() !== month ||
+        date.getDate() !== Number(day)) {
+      return null;
+    }
+    return date.getTime();
+  }
+
+  const relative = text.match(/^(today|yesterday|tomorrow)(?:\s+(.+))?$/i);
+  if (relative) {
+    const base = new Date();
+    base.setHours(0, 0, 0, 0);
+    if (relative[1].toLowerCase() === "yesterday") base.setDate(base.getDate() - 1);
+    if (relative[1].toLowerCase() === "tomorrow") base.setDate(base.getDate() + 1);
+    const clock = parseClock(relative[2] ?? "");
+    if (!clock) return null;
+    base.setHours(clock.hour, clock.minute, clock.second, clock.millisecond);
+    return base.getTime();
+  }
+
+  if (/^now$/i.test(text)) return Date.now();
+
+  const numericYmd = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T]+(.+))?$/);
+  if (numericYmd) {
+    const parsedLocal = makeLocal(numericYmd[1], Number(numericYmd[2]) - 1, numericYmd[3], numericYmd[4]);
+    if (parsedLocal !== null) return parsedLocal;
+  }
+
+  const numericDmy = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?:[ T]+(.+))?$/);
+  if (numericDmy) {
+    return makeLocal(numericDmy[3], Number(numericDmy[2]) - 1, numericDmy[1], numericDmy[4]);
+  }
+
+  const dayMonthName = text.match(/^(\d{1,2})\s+([a-z]+)\s+(\d{2,4})(?:\s+(.+))?$/i);
+  if (dayMonthName) {
+    const month = monthNames[dayMonthName[2].toLowerCase()];
+    if (month !== undefined) return makeLocal(dayMonthName[3], month, dayMonthName[1], dayMonthName[4]);
+  }
+
+  const monthNameDay = text.replace(/,/g, "").match(/^([a-z]+)\s+(\d{1,2})\s+(\d{2,4})(?:\s+(.+))?$/i);
+  if (monthNameDay) {
+    const month = monthNames[monthNameDay[1].toLowerCase()];
+    if (month !== undefined) return makeLocal(monthNameDay[3], month, monthNameDay[2], monthNameDay[4]);
+  }
+
+  // Preserve explicit timezone offsets/Z and other unambiguous forms understood
+  // by the browser, after handling ambiguous numeric dates as UK day/month/year.
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function updateStatus(message) {
@@ -408,21 +516,15 @@ class WebGLTraceRenderer {
       out vec4 out_color;
 
       vec3 heatColour(float density) {
-        float level = clamp(log2(max(density, 1.0)), 0.0, 6.0);
+        float heat = clamp(log2(max(density, 1.0)) / 6.0, 0.0, 1.0);
         vec3 blue = vec3(0.08, 0.38, 1.0);
-        vec3 purple = vec3(0.47, 0.18, 0.72);
         vec3 red = vec3(0.96, 0.10, 0.05);
-        vec3 orange = vec3(1.0, 0.48, 0.04);
         vec3 yellow = vec3(1.0, 0.90, 0.05);
-        vec3 brown = vec3(0.42, 0.18, 0.03);
-        vec3 black = vec3(0.02, 0.02, 0.02);
 
-        if (level < 1.0) return mix(blue, purple, level);
-        if (level < 2.0) return mix(purple, red, level - 1.0);
-        if (level < 3.0) return mix(red, orange, level - 2.0);
-        if (level < 4.0) return mix(orange, yellow, level - 3.0);
-        if (level < 5.0) return mix(yellow, brown, level - 4.0);
-        return mix(brown, black, level - 5.0);
+        if (heat < 0.5) {
+          return mix(blue, red, heat * 2.0);
+        }
+        return mix(red, yellow, (heat - 0.5) * 2.0);
       }
 
       void main() {
@@ -1397,12 +1499,12 @@ function render() {
   if (state.minTime === null) return;
 
   const renderStartedAt = performance.now();
-  const start = new Date(ui.startTime.value).getTime();
-  const end = new Date(ui.endTime.value).getTime();
+  const start = parseFilterDateTime(ui.startTime.value, false);
+  const end = parseFilterDateTime(ui.endTime.value, true);
   const anomalyMode = ui.anomalyMode.value;
 
-  if (!Number.isFinite(start) || !Number.isFinite(end)) {
-    updateStatus("Choose a valid start and end date/time.");
+  if (start === null || end === null) {
+    updateStatus("Could not parse the start or end date/time.");
     return;
   }
   if (start > end) {
@@ -1519,8 +1621,8 @@ function fitVisible() {
 }
 
 function setFullRange(renderNow = true) {
-  ui.startTime.value = localInputValue(state.minTime);
-  ui.endTime.value = localInputValue(state.maxTime);
+  ui.startTime.value = formatFilterInput(state.minTime);
+  ui.endTime.value = formatFilterInput(state.maxTime);
   if (renderNow) {
     render();
     fitVisible();
@@ -1616,6 +1718,11 @@ ui.fileInput.addEventListener("change", async event => {
 
 ui.loadDefault.addEventListener("click", loadDefaultData);
 ui.applyFilter.addEventListener("click", render);
+for (const input of [ui.startTime, ui.endTime]) {
+  input.addEventListener("keydown", event => {
+    if (event.key === "Enter") render();
+  });
+}
 ui.fullRange.addEventListener("click", () => setFullRange(true));
 ui.fitTraces.addEventListener("click", fitVisible);
 ui.showPaths.addEventListener("change", render);

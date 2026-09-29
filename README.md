@@ -27,12 +27,12 @@ The map background uses OpenStreetMap tiles, so viewing the map requires network
 
 ## What is rendered
 
-- `semanticSegments[].timelinePath`: rendered as Timeline traces; overlapping trace pixels accumulate into a WebGL density map (blue for one traversal, red around four, yellow around sixteen, dark brown around thirty-two, and near-black around sixty-four or more). Single-point path segments are shown as small points.
+- `semanticSegments[].timelinePath`: rendered as Timeline traces; overlapping trace pixels accumulate into a WebGL density map using a logarithmic blue → red → yellow scale stretched across roughly one to sixty-four traversals. Single-point path segments are shown as small points.
 - `rawSignals[].position`: sorted by timestamp and joined into dashed traces when consecutive records are no more than 30 minutes and 50 km apart. Raw traces are drawn separately and do not contribute to Timeline density.
 - Activity start/end coordinates are deliberately not connected because some records span long periods or long-distance travel and would create misleading straight lines.
 
 ## Filtering
 
-Use the **From** and **To** date/time controls and press **Apply filter**. **Full range** restores the complete range found in the loaded export.
+Enter **From** and **To** as ordinary text and press **Apply filter** (or Enter). Accepted forms include ISO-style dates, UK numeric dates such as `29/09/2026 14:30`, month names such as `29 Sep 2026 2:30pm`, and `today`, `yesterday`, `tomorrow`, or `now`. A date without a time means the start of that day for **From** and the end of that day for **To**. **Full range** restores the complete range found in the loaded export.
 
-Date/time inputs are interpreted in the browser's local timezone. Timeline timestamps themselves are parsed from the offsets stored in the Google export.
+Dates without an explicit timezone are interpreted in the browser's local timezone. Timeline timestamps themselves are parsed from the offsets stored in the Google export.

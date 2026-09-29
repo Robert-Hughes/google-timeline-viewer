@@ -52,7 +52,7 @@ legend {
 }
 
 input[type="file"],
-input[type="datetime-local"],
+input[type="text"],
 button {
   width: 100%;
   margin-top: 6px;
@@ -60,7 +60,7 @@ button {
 }
 
 input[type="file"],
-input[type="datetime-local"] {
+input[type="text"] {
   padding: 8px;
   border: 1px solid #cbd5e1;
   border-radius: 6px;
