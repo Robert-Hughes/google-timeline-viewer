@@ -19,6 +19,8 @@ const ui = {
   fitTraces: document.getElementById("fit-traces"),
   showPaths: document.getElementById("show-paths"),
   showRaw: document.getElementById("show-raw"),
+  anomalyMode: document.getElementById("anomaly-mode"),
+  anomalyCount: document.getElementById("anomaly-count"),
   pathCount: document.getElementById("path-count"),
   rawCount: document.getElementById("raw-count"),
   visibleCount: document.getElementById("visible-count"),
@@ -29,6 +31,8 @@ const ui = {
 const state = {
   timelinePaths: [],
   rawPoints: [],
+  anomalyCases: [],
+  anomalyLegCount: 0,
   minTime: null,
   maxTime: null,
   pathLayer: null,
@@ -232,6 +236,7 @@ class WebGLTraceRenderer {
 
     this.buffers = {
       timeline: this.createDataBuffer(),
+      anomaly: this.createDataBuffer(),
       raw: this.createDataBuffer(),
       points: this.createDataBuffer()
     };
@@ -402,35 +407,28 @@ class WebGLTraceRenderer {
 
   setData(segments, singletonPoints) {
     const startedAt = performance.now();
-    let timelineCount = 0;
-    let rawCount = 0;
+    const counts = { timeline: 0, anomaly: 0, raw: 0 };
     for (const segment of segments) {
-      if (segment.source === "raw") {
-        rawCount += 1;
-      } else {
-        timelineCount += 1;
-      }
+      counts[segment.source] += 1;
     }
 
-    const timeline = new Float32Array(timelineCount * 4);
-    const raw = new Float32Array(rawCount * 4);
-    let timelineOffset = 0;
-    let rawOffset = 0;
+    const arrays = {
+      timeline: new Float32Array(counts.timeline * 4),
+      anomaly: new Float32Array(counts.anomaly * 4),
+      raw: new Float32Array(counts.raw * 4)
+    };
+    const offsets = { timeline: 0, anomaly: 0, raw: 0 };
 
     for (const segment of segments) {
       const start = this.latLngToWorld(segment.a.latLng);
       const end = this.latLngToWorld(segment.b.latLng);
-      const target = segment.source === "raw" ? raw : timeline;
-      const offset = segment.source === "raw" ? rawOffset : timelineOffset;
+      const target = arrays[segment.source];
+      const offset = offsets[segment.source];
       target[offset] = start[0];
       target[offset + 1] = start[1];
       target[offset + 2] = end[0];
       target[offset + 3] = end[1];
-      if (segment.source === "raw") {
-        rawOffset += 4;
-      } else {
-        timelineOffset += 4;
-      }
+      offsets[segment.source] += 4;
     }
 
     const points = new Float32Array(singletonPoints.length * 2);
@@ -440,15 +438,16 @@ class WebGLTraceRenderer {
       points[index * 2 + 1] = world[1];
     }
 
-    this.uploadBuffer(this.buffers.timeline, timeline, 4);
-    this.uploadBuffer(this.buffers.raw, raw, 4);
+    this.uploadBuffer(this.buffers.timeline, arrays.timeline, 4);
+    this.uploadBuffer(this.buffers.anomaly, arrays.anomaly, 4);
+    this.uploadBuffer(this.buffers.raw, arrays.raw, 4);
     this.uploadBuffer(this.buffers.points, points, 2);
     this.requestDraw();
 
     recordPerf(
       "upload WebGL trace buffers",
       startedAt,
-      `${segments.length.toLocaleString()} segments, ${singletonPoints.length.toLocaleString()} points`
+      `${segments.length.toLocaleString()} segments, ${counts.anomaly.toLocaleString()} anomalous`
     );
   }
 
@@ -542,6 +541,11 @@ class WebGLTraceRenderer {
       new Float32Array([0.2, 0.533, 1.0, 0.75])
     );
     this.drawSegments(
+      this.buffers.anomaly,
+      4,
+      new Float32Array([0.9, 0.25, 0.15, 0.95])
+    );
+    this.drawSegments(
       this.buffers.raw,
       2,
       new Float32Array([0.2, 0.533, 1.0, 0.55]),
@@ -590,19 +594,45 @@ function getTraceRenderer() {
 function extractTimeline(data) {
   const timelinePaths = [];
   const rawPoints = [];
+  const visits = [];
   let minTime = Infinity;
   let maxTime = -Infinity;
 
-  for (const segment of data.semanticSegments ?? []) {
+  for (let segmentIndex = 0; segmentIndex < (data.semanticSegments ?? []).length; segmentIndex += 1) {
+    const segment = data.semanticSegments[segmentIndex];
+    const visit = segment.visit;
+    const visitLocation = parseLatLng(visit?.topCandidate?.placeLocation?.latLng);
+    const visitStart = parseTime(segment.startTime);
+    const visitEnd = parseTime(segment.endTime);
+
+    if (visit && visitLocation && visitStart !== null && visitEnd !== null) {
+      visits.push({
+        segmentIndex,
+        start: visitStart,
+        end: visitEnd,
+        latLng: visitLocation,
+        probability: Number(visit.probability) || 0,
+        candidateProbability: Number(visit.topCandidate?.probability) || 0,
+        semanticType: visit.topCandidate?.semanticType ?? "UNKNOWN"
+      });
+    }
+
     if (!Array.isArray(segment.timelinePath)) continue;
 
     const points = [];
-    for (const item of segment.timelinePath) {
+    for (let pointIndex = 0; pointIndex < segment.timelinePath.length; pointIndex += 1) {
+      const item = segment.timelinePath[pointIndex];
       const latLng = parseLatLng(item.point);
       const time = parseTime(item.time);
       if (!latLng || time === null) continue;
 
-      points.push({ latLng, time });
+      points.push({
+        latLng,
+        time,
+        semanticSegmentIndex: segmentIndex,
+        pathPointIndex: pointIndex,
+        anomaliesFromPrevious: []
+      });
       minTime = Math.min(minTime, time);
       maxTime = Math.max(maxTime, time);
     }
@@ -612,6 +642,13 @@ function extractTimeline(data) {
       timelinePaths.push(points);
     }
   }
+
+  visits.sort((a, b) => a.start - b.start);
+  const anomalyCases = detectTimelineAnomalies(timelinePaths, visits);
+  const anomalyLegCount = timelinePaths.reduce(
+    (count, path) => count + path.filter(point => point.anomaliesFromPrevious.length > 0).length,
+    0
+  );
 
   for (const signal of data.rawSignals ?? []) {
     const position = signal.position;
@@ -638,7 +675,7 @@ function extractTimeline(data) {
     throw new Error("No timestamped coordinates were found in this Timeline export.");
   }
 
-  return { timelinePaths, rawPoints, minTime, maxTime };
+  return { timelinePaths, rawPoints, anomalyCases, anomalyLegCount, minTime, maxTime };
 }
 
 function distanceKm(a, b) {
@@ -650,6 +687,128 @@ function distanceKm(a, b) {
   const h = Math.sin(dLat / 2) ** 2 +
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+function detectTimelineAnomalies(timelinePaths, visits) {
+  const anomalyCases = [];
+  let nextCaseId = 1;
+
+  function overlappingVisits(time) {
+    let low = 0;
+    let high = visits.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (visits[middle].start <= time) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+
+    const matches = [];
+    for (let index = low - 1; index >= 0; index -= 1) {
+      const visit = visits[index];
+      if (time - visit.start > 72 * 60 * 60_000 && visit.end < time) break;
+      if (visit.start <= time && visit.end >= time) {
+        matches.push(visit);
+      }
+    }
+    return matches;
+  }
+
+  function strongVisitConflict(point) {
+    for (const visit of overlappingVisits(point.time)) {
+      const minutesFromStart = (point.time - visit.start) / 60_000;
+      const minutesToEnd = (visit.end - point.time) / 60_000;
+      const distanceFromVisitKm = distanceKm(point.latLng, visit.latLng);
+
+      if (visit.probability >= 0.65 &&
+          visit.candidateProbability >= 0.80 &&
+          minutesFromStart >= 5 &&
+          minutesToEnd >= 5 &&
+          distanceFromVisitKm >= 30) {
+        return {
+          visit,
+          distanceFromVisitKm
+        };
+      }
+    }
+    return null;
+  }
+
+  function markLeg(destinationPoint, anomalyCase) {
+    destinationPoint.anomaliesFromPrevious.push({
+      caseId: anomalyCase.id,
+      rule: anomalyCase.rule,
+      reason: anomalyCase.reason
+    });
+  }
+
+  for (const path of timelinePaths) {
+    for (let index = 1; index + 1 < path.length; index += 1) {
+      const before = path[index - 1];
+      const point = path[index];
+      const after = path[index + 1];
+      const distanceInKm = distanceKm(before.latLng, point.latLng);
+      const distanceOutKm = distanceKm(point.latLng, after.latLng);
+      const bypassDistanceKm = distanceKm(before.latLng, after.latLng);
+      const elapsedMinutes = (after.time - before.time) / 60_000;
+
+      if (distanceInKm >= 50 &&
+          distanceOutKm >= 50 &&
+          bypassDistanceKm <= 10 &&
+          elapsedMinutes > 0 &&
+          elapsedMinutes <= 30) {
+        const anomalyCase = {
+          id: nextCaseId++,
+          rule: "isolated-spatial-spike",
+          reason: "Isolated spatial spike: " + distanceInKm.toFixed(1) + " km out, " +
+            distanceOutKm.toFixed(1) + " km back, while surrounding points are " +
+            bypassDistanceKm.toFixed(1) + " km apart.",
+          semanticSegmentIndex: point.semanticSegmentIndex,
+          time: point.time,
+          latLng: point.latLng
+        };
+        anomalyCases.push(anomalyCase);
+        markLeg(point, anomalyCase);
+        markLeg(after, anomalyCase);
+      }
+    }
+
+    for (let index = 1; index < path.length; index += 1) {
+      const startPoint = path[index - 1];
+      const endPoint = path[index];
+      const legDistanceKm = distanceKm(startPoint.latLng, endPoint.latLng);
+      const elapsedHours = (endPoint.time - startPoint.time) / 3_600_000;
+      if (elapsedHours <= 0) continue;
+
+      const speedKmh = legDistanceKm / elapsedHours;
+      if (legDistanceKm < 30 || speedKmh < 180) continue;
+
+      const startConflict = strongVisitConflict(startPoint);
+      const endConflict = strongVisitConflict(endPoint);
+      const conflict = startConflict ?? endConflict;
+      if (!conflict) continue;
+
+      const conflictingPoint = startConflict ? startPoint : endPoint;
+      const anomalyCase = {
+        id: nextCaseId++,
+        rule: "implausible-leg-with-visit-conflict",
+        reason: "Implausible leg: " + legDistanceKm.toFixed(1) + " km in " +
+          ((endPoint.time - startPoint.time) / 60_000).toFixed(1) + " min (" +
+          speedKmh.toFixed(0) + " km/h), while an overlapping high-confidence " +
+          conflict.visit.semanticType.toLowerCase() + " visit is " +
+          conflict.distanceFromVisitKm.toFixed(1) + " km from the conflicting endpoint.",
+        semanticSegmentIndex: startPoint.semanticSegmentIndex,
+        time: conflictingPoint.time,
+        latLng: conflictingPoint.latLng
+      };
+      anomalyCases.push(anomalyCase);
+      markLeg(endPoint, anomalyCase);
+    }
+  }
+
+  return anomalyCases;
 }
 
 function buildRawTraces(points, start, end) {
@@ -752,13 +911,22 @@ function addBounds(bounds, latLngs) {
   }
 }
 
-function appendTraceSegments(target, traces, source) {
+function appendTraceSegments(target, traces, source, anomalyMode = "show") {
   for (const trace of traces) {
     for (let i = 1; i < trace.length; i += 1) {
+      const anomalies = source === "timeline"
+        ? (trace[i].anomaliesFromPrevious ?? [])
+        : [];
+      const isAnomaly = anomalies.length > 0;
+
+      if (source === "timeline" && anomalyMode === "hide" && isAnomaly) continue;
+      if (source === "timeline" && anomalyMode === "only" && !isAnomaly) continue;
+
       target.push({
         a: trace[i - 1],
         b: trace[i],
-        source
+        source: isAnomaly ? "anomaly" : source,
+        anomaly: isAnomaly ? anomalies[0] : null
       });
     }
   }
@@ -878,7 +1046,8 @@ function findNearestTracePoint(containerPoint) {
       distanceSquared: nearest.distanceSquared,
       latLng,
       time,
-      source: segment.source
+      source: segment.source,
+      anomaly: segment.anomaly
     };
   }
 
@@ -915,13 +1084,20 @@ function updateHoverTooltip(event) {
   }
 
   const tooltip = ensureHoverTooltip();
-  const sourceLabel = nearest.source === "raw" ? "Raw position trace" : "Timeline path";
+  const sourceLabel = nearest.source === "raw"
+    ? "Raw position trace"
+    : nearest.source === "anomaly"
+      ? "Potentially anomalous Timeline leg"
+      : "Timeline path";
+  const anomalyDetail = nearest.anomaly
+    ? `<br><span class="trace-tooltip-source">${nearest.anomaly.reason}</span>`
+    : "";
   tooltip
     .setLatLng(nearest.latLng)
     .setContent(
       `<strong>${formatCoordinates(nearest.latLng)}</strong><br>` +
       `${new Date(nearest.time).toLocaleString()}<br>` +
-      `<span class="trace-tooltip-source">${sourceLabel}</span>`
+      `<span class="trace-tooltip-source">${sourceLabel}</span>${anomalyDetail}`
     );
 
   if (!map.hasLayer(tooltip)) {
@@ -1018,6 +1194,7 @@ function render() {
   const renderStartedAt = performance.now();
   const start = new Date(ui.startTime.value).getTime();
   const end = new Date(ui.endTime.value).getTime();
+  const anomalyMode = ui.anomalyMode.value;
 
   if (!Number.isFinite(start) || !Number.isFinite(end)) {
     updateStatus("Choose a valid start and end date/time.");
@@ -1047,48 +1224,80 @@ function render() {
 
   if (ui.showPaths.checked) {
     stageStartedAt = performance.now();
-    const pathLatLngs = pointsToLatLngs(pathResult.traces);
-    addBounds(bounds, pathLatLngs);
-    addBounds(bounds, pathResult.singletonPoints.map(point => point.latLng));
-    appendTraceSegments(state.visibleSegments, pathResult.traces, "timeline");
-    recordPerf("prepare timeline bounds + hover segments", stageStartedAt);
+    appendTraceSegments(state.visibleSegments, pathResult.traces, "timeline", anomalyMode);
+    recordPerf("prepare timeline hover segments", stageStartedAt);
   }
 
-  if (ui.showRaw.checked && rawResult.traces.length) {
+  if (anomalyMode !== "only" && ui.showRaw.checked && rawResult.traces.length) {
     stageStartedAt = performance.now();
-    addBounds(bounds, pointsToLatLngs(rawResult.traces));
     appendTraceSegments(state.visibleSegments, rawResult.traces, "raw");
-    recordPerf("prepare raw bounds + hover segments", stageStartedAt);
+    recordPerf("prepare raw hover segments", stageStartedAt);
+  }
+
+  for (const segment of state.visibleSegments) {
+    bounds.extend(segment.a.latLng);
+    bounds.extend(segment.b.latLng);
+  }
+
+  const visibleSingletonPoints =
+    ui.showPaths.checked && anomalyMode !== "only"
+      ? pathResult.singletonPoints
+      : [];
+  for (const point of visibleSingletonPoints) {
+    bounds.extend(point.latLng);
   }
 
   const traceRenderer = getTraceRenderer();
   if (traceRenderer) {
-    traceRenderer.setData(
-      state.visibleSegments,
-      ui.showPaths.checked ? pathResult.singletonPoints : []
-    );
+    traceRenderer.setData(state.visibleSegments, visibleSingletonPoints);
   } else {
-    if (ui.showPaths.checked) {
-      stageStartedAt = performance.now();
-      state.pathLayer = createPathLayer(pathResult.traces, pathResult.singletonPoints).addTo(map);
-      recordPerf("create timeline Leaflet fallback layer", stageStartedAt);
+    const group = L.layerGroup();
+    const normalPairs = state.visibleSegments
+      .filter(segment => segment.source === "timeline")
+      .map(segment => [segment.a.latLng, segment.b.latLng]);
+    const anomalyPairs = state.visibleSegments
+      .filter(segment => segment.source === "anomaly")
+      .map(segment => [segment.a.latLng, segment.b.latLng]);
+    const rawPairs = state.visibleSegments
+      .filter(segment => segment.source === "raw")
+      .map(segment => [segment.a.latLng, segment.b.latLng]);
+
+    if (normalPairs.length) {
+      L.polyline(normalPairs, { renderer: canvasRenderer, weight: 3, opacity: 0.75 }).addTo(group);
     }
-    if (ui.showRaw.checked && rawResult.traces.length) {
-      stageStartedAt = performance.now();
-      state.rawLayer = createRawLayer(rawResult.traces).addTo(map);
-      recordPerf("create raw Leaflet fallback layer", stageStartedAt);
+    if (anomalyPairs.length) {
+      L.polyline(anomalyPairs, {
+        renderer: canvasRenderer,
+        weight: 4,
+        opacity: 0.95,
+        color: "#e64026"
+      }).addTo(group);
     }
+    if (rawPairs.length) {
+      L.polyline(rawPairs, {
+        renderer: canvasRenderer,
+        weight: 2,
+        opacity: 0.55,
+        dashArray: "4 4"
+      }).addTo(group);
+    }
+    state.pathLayer = group.addTo(map);
   }
 
   scheduleHoverGridRebuild();
 
   state.visibleBounds = bounds.isValid() ? bounds : null;
   ui.visibleCount.textContent =
-    (pathResult.visibleCount + rawResult.visibleCount).toLocaleString();
+    (pathResult.visibleCount + (anomalyMode === "only" ? 0 : rawResult.visibleCount)).toLocaleString();
 
+  const visibleAnomalyLegs = state.visibleSegments
+    .filter(segment => segment.source === "anomaly").length;
   const fromText = new Date(start).toLocaleString();
   const toText = new Date(end).toLocaleString();
-  updateStatus(`Showing ${fromText} – ${toText}.`);
+  updateStatus(
+    `Showing ${fromText} – ${toText}. ` +
+    `${visibleAnomalyLegs.toLocaleString()} potentially anomalous legs visible.`
+  );
 
   recordPerf(
     "render total (sync)",
@@ -1127,11 +1336,15 @@ async function loadData(data, label) {
 
   state.timelinePaths = extracted.timelinePaths;
   state.rawPoints = extracted.rawPoints;
+  state.anomalyCases = extracted.anomalyCases;
+  state.anomalyLegCount = extracted.anomalyLegCount;
   state.minTime = extracted.minTime;
   state.maxTime = extracted.maxTime;
 
   ui.pathCount.textContent = state.timelinePaths.length.toLocaleString();
   ui.rawCount.textContent = state.rawPoints.length.toLocaleString();
+  ui.anomalyCount.textContent =
+    `${state.anomalyCases.length.toLocaleString()} cases / ${state.anomalyLegCount.toLocaleString()} legs`;
   ui.applyFilter.disabled = false;
   ui.fullRange.disabled = false;
   ui.fitTraces.disabled = false;
@@ -1144,7 +1357,9 @@ async function loadData(data, label) {
   recordPerf("fit visible traces", fitStartedAt);
 
   updateStatus(
-    `Loaded ${label}. Data range: ${new Date(state.minTime).toLocaleString()} – ${new Date(state.maxTime).toLocaleString()}.`
+    `Loaded ${label}. Data range: ${new Date(state.minTime).toLocaleString()} – ` +
+    `${new Date(state.maxTime).toLocaleString()}. Detected ` +
+    `${state.anomalyCases.length} potential anomaly cases (${state.anomalyLegCount} legs); hidden by default.`
   );
 }
 
@@ -1200,6 +1415,7 @@ ui.fullRange.addEventListener("click", () => setFullRange(true));
 ui.fitTraces.addEventListener("click", fitVisible);
 ui.showPaths.addEventListener("change", render);
 ui.showRaw.addEventListener("change", render);
+ui.anomalyMode.addEventListener("change", render);
 
 map.on("mousemove", scheduleHover);
 map.on("mouseout", hideHoverTooltip);

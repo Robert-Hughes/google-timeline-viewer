@@ -114,6 +114,37 @@ fieldset {
   margin-right: 7px;
 }
 
+.anomaly-mode {
+  display: block;
+  margin-top: 12px;
+}
+
+.anomaly-mode select {
+  width: 100%;
+  margin-top: 6px;
+  padding: 7px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  font: inherit;
+}
+
+.anomaly-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #e5e7eb;
+  color: #6b7280;
+  font-size: 0.8rem;
+}
+
+.anomaly-summary strong {
+  color: #1f2937;
+  font-variant-numeric: tabular-nums;
+}
+
 .stats {
   margin: 18px 0 0;
 }

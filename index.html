@@ -40,6 +40,15 @@
         <legend>Layers</legend>
         <label class="checkbox"><input id="show-paths" type="checkbox" checked> Timeline paths</label>
         <label class="checkbox"><input id="show-raw" type="checkbox" checked> Raw positions</label>
+        <label class="anomaly-mode">
+          Potential anomalies
+          <select id="anomaly-mode">
+            <option value="hide" selected>Hide anomalous legs</option>
+            <option value="show">Show all (highlight anomalies)</option>
+            <option value="only">Show anomalous legs only</option>
+          </select>
+        </label>
+        <div class="anomaly-summary"><span>Detected anomaly cases</span><strong id="anomaly-count">–</strong></div>
       </fieldset>
 
       <button id="fit-traces" type="button" disabled>Fit visible traces</button>
