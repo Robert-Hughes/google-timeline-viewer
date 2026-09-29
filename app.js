@@ -42,6 +42,7 @@ const state = {
   inferredStitches: [],
   anomalyCases: [],
   anomalyLegCount: 0,
+  anomalyPointCount: 0,
   minTime: null,
   maxTime: null,
   pathLayer: null,
@@ -524,7 +525,8 @@ class WebGLTraceRenderer {
       anomaly: this.createDataBuffer(),
       stitch: this.createDataBuffer(),
       raw: this.createDataBuffer(),
-      points: this.createDataBuffer()
+      points: this.createDataBuffer(),
+      anomalyPoints: this.createDataBuffer()
     };
 
     this.drawQueued = false;
@@ -740,7 +742,7 @@ class WebGLTraceRenderer {
     target.count = values.length / componentsPerVertex;
   }
 
-  setData(segments, singletonPoints) {
+  setData(segments, singletonPoints, anomalyPoints = []) {
     const startedAt = performance.now();
     const counts = { timeline: 0, anomaly: 0, stitch: 0, raw: 0 };
     for (const segment of segments) {
@@ -779,6 +781,13 @@ class WebGLTraceRenderer {
     this.uploadBuffer(this.buffers.stitch, arrays.stitch, 4);
     this.uploadBuffer(this.buffers.raw, arrays.raw, 4);
     this.uploadBuffer(this.buffers.points, points, 2);
+    const anomalyPointValues = new Float32Array(anomalyPoints.length * 2);
+    for (let index = 0; index < anomalyPoints.length; index += 1) {
+      const world = this.latLngToWorld(anomalyPoints[index].latLng);
+      anomalyPointValues[index * 2] = world[0];
+      anomalyPointValues[index * 2 + 1] = world[1];
+    }
+    this.uploadBuffer(this.buffers.anomalyPoints, anomalyPointValues, 2);
     this.requestDraw();
 
     recordPerf(
@@ -883,7 +892,7 @@ class WebGLTraceRenderer {
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, bufferInfo.count);
   }
 
-  drawPoints(bufferInfo) {
+  drawPoints(bufferInfo, pointSize = 4, color = new Float32Array([0.2, 0.533, 1.0, 0.75])) {
     if (!bufferInfo.count) return;
 
     const gl = this.gl;
@@ -896,8 +905,8 @@ class WebGLTraceRenderer {
     gl.vertexAttribPointer(info.world, 2, gl.FLOAT, false, 0, 0);
     gl.vertexAttribDivisor(info.world, 0);
 
-    gl.uniform1f(info.pointSize, 4);
-    gl.uniform4fv(info.color, new Float32Array([0.2, 0.533, 1.0, 0.75]));
+    gl.uniform1f(info.pointSize, pointSize);
+    gl.uniform4fv(info.color, color);
     gl.drawArrays(gl.POINTS, 0, bufferInfo.count);
   }
 
@@ -972,6 +981,11 @@ class WebGLTraceRenderer {
       8
     );
     this.drawPoints(this.buffers.points);
+    this.drawPoints(
+      this.buffers.anomalyPoints,
+      8,
+      new Float32Array([0.9, 0.25, 0.15, 0.95])
+    );
   }
 
   handleZoomAnimation(event) {
@@ -1076,7 +1090,9 @@ function extractTimeline(data) {
         time,
         semanticSegmentIndex: segmentIndex,
         pathPointIndex: pointIndex,
-        anomaliesFromPrevious: []
+        anomaliesFromPrevious: [],
+        observationAnomaly: null,
+        excludeFromStitching: false
       });
       minTime = Math.min(minTime, time);
       maxTime = Math.max(maxTime, time);
@@ -1097,6 +1113,10 @@ function extractTimeline(data) {
   const anomalyCases = detectTimelineAnomalies(timelinePaths, visits);
   const anomalyLegCount = timelinePaths.reduce(
     (count, path) => count + path.filter(point => point.anomaliesFromPrevious.length > 0).length,
+    0
+  );
+  const anomalyPointCount = timelinePaths.reduce(
+    (count, path) => count + path.filter(point => point.observationAnomaly).length,
     0
   );
 
@@ -1137,6 +1157,7 @@ function extractTimeline(data) {
     inferredStitches,
     anomalyCases,
     anomalyLegCount,
+    anomalyPointCount,
     minTime,
     maxTime
   };
@@ -1233,7 +1254,7 @@ function buildInferredStitches(timelinePaths, rawPoints) {
   const observations = [];
 
   for (const path of timelinePaths) {
-    observations.push(...path);
+    observations.push(...path.filter(point => !point.excludeFromStitching));
   }
   observations.push(...rawPoints);
   observations.sort((a, b) => {
@@ -1406,6 +1427,57 @@ function detectTimelineAnomalies(timelinePaths, visits) {
     }
   }
 
+  const chronologicalPoints = timelinePaths
+    .flat()
+    .slice()
+    .sort((a, b) => a.time - b.time);
+
+  for (let index = 1; index + 1 < chronologicalPoints.length; index += 1) {
+    const before = chronologicalPoints[index - 1];
+    const point = chronologicalPoints[index];
+    const after = chronologicalPoints[index + 1];
+    const conflict = strongVisitConflict(point);
+    if (!conflict) continue;
+
+    const distanceInKm = distanceKm(before.latLng, point.latLng);
+    const distanceOutKm = distanceKm(point.latLng, after.latLng);
+    const bypassDistanceKm = distanceKm(before.latLng, after.latLng);
+    const elapsedHours = (after.time - before.time) / 3_600_000;
+
+    if (distanceInKm < 50 ||
+        distanceOutKm < 50 ||
+        bypassDistanceKm > 10 ||
+        elapsedHours <= 0 ||
+        elapsedHours > 36) {
+      continue;
+    }
+
+    let anomalyCase = anomalyCases.find(
+      candidate =>
+        candidate.semanticSegmentIndex === point.semanticSegmentIndex &&
+        candidate.time === point.time
+    );
+
+    if (!anomalyCase) {
+      anomalyCase = {
+        id: nextCaseId++,
+        rule: "isolated-observation-with-visit-conflict",
+        reason: "Isolated Timeline observation: " + distanceInKm.toFixed(1) +
+          " km from the preceding point and " + distanceOutKm.toFixed(1) +
+          " km from the following point, while those surrounding points are " +
+          bypassDistanceKm.toFixed(1) + " km apart and an overlapping high-confidence " +
+          conflict.visit.semanticType.toLowerCase() + " visit is " +
+          conflict.distanceFromVisitKm.toFixed(1) + " km away.",
+        semanticSegmentIndex: point.semanticSegmentIndex,
+        time: point.time,
+        latLng: point.latLng
+      };
+      anomalyCases.push(anomalyCase);
+    }
+
+    point.observationAnomaly = anomalyCase;
+    point.excludeFromStitching = true;
+  }
   return anomalyCases;
 }
 
@@ -1432,9 +1504,10 @@ function buildRawTraces(points, start, end) {
   return { traces, visibleCount: visible.length };
 }
 
-function filteredTimelinePaths(start, end) {
+function filteredTimelinePaths(start, end, anomalyMode) {
   const traces = [];
   const singletonPoints = [];
+  const anomalySingletonPoints = [];
   let visibleCount = 0;
 
   for (const path of state.timelinePaths) {
@@ -1444,11 +1517,20 @@ function filteredTimelinePaths(start, end) {
     if (visible.length >= 2) {
       traces.push(visible);
     } else if (visible.length === 1) {
-      singletonPoints.push(visible[0]);
+      const point = visible[0];
+      if (point.observationAnomaly) {
+        if (anomalyMode === "normal") {
+          singletonPoints.push(point);
+        } else if (anomalyMode !== "hide") {
+          anomalySingletonPoints.push(point);
+        }
+      } else if (anomalyMode !== "only") {
+        singletonPoints.push(point);
+      }
     }
   }
 
-  return { traces, singletonPoints, visibleCount };
+  return { traces, singletonPoints, anomalySingletonPoints, visibleCount };
 }
 
 function pointsToLatLngs(traces) {
@@ -1899,7 +1981,7 @@ function render() {
   recordPerf("remove old layers", stageStartedAt);
 
   stageStartedAt = performance.now();
-  const pathResult = filteredTimelinePaths(start, end);
+  const pathResult = filteredTimelinePaths(start, end, anomalyMode);
   recordPerf("filter timeline paths", stageStartedAt, `${pathResult.visibleCount.toLocaleString()} points`);
 
   stageStartedAt = performance.now();
@@ -1954,13 +2036,17 @@ function render() {
     ui.showPaths.checked && !anomalyOnly && !stitchOnly
       ? pathResult.singletonPoints
       : [];
-  for (const point of visibleSingletonPoints) {
+  const visibleAnomalyPoints =
+    ui.showPaths.checked && anomalyMode !== "hide" && (!stitchOnly || anomalyOnly)
+      ? pathResult.anomalySingletonPoints
+      : [];
+  for (const point of [...visibleSingletonPoints, ...visibleAnomalyPoints]) {
     bounds.extend(point.latLng);
   }
 
   const traceRenderer = getTraceRenderer();
   if (traceRenderer) {
-    traceRenderer.setData(state.renderSegments, visibleSingletonPoints);
+    traceRenderer.setData(state.renderSegments, visibleSingletonPoints, visibleAnomalyPoints);
   } else {
     const group = L.layerGroup();
     const normalPairs = state.renderSegments
@@ -2004,6 +2090,16 @@ function render() {
         dashArray: "4 4"
       }).addTo(group);
     }
+    for (const point of visibleAnomalyPoints) {
+      L.circleMarker(point.latLng, {
+        renderer: canvasRenderer,
+        radius: 5,
+        weight: 2,
+        color: "#e64026",
+        fillColor: "#e64026",
+        fillOpacity: 0.85
+      }).addTo(group);
+    }
     state.pathLayer = group.addTo(map);
   }
 
@@ -2023,7 +2119,7 @@ function render() {
     if (ui.showPaths.checked) visiblePointCount += pathResult.visibleCount;
     if (ui.showRaw.checked) visiblePointCount += rawResult.visibleCount;
   } else {
-    visiblePointCount = 2 * (visibleAnomalyLegs + visibleStitchLegs);
+    visiblePointCount = 2 * (visibleAnomalyLegs + visibleStitchLegs) + visibleAnomalyPoints.length;
   }
   ui.visibleCount.textContent = visiblePointCount.toLocaleString();
 
@@ -2076,13 +2172,15 @@ async function loadData(data, label) {
   state.inferredStitches = extracted.inferredStitches;
   state.anomalyCases = extracted.anomalyCases;
   state.anomalyLegCount = extracted.anomalyLegCount;
+  state.anomalyPointCount = extracted.anomalyPointCount;
   state.minTime = extracted.minTime;
   state.maxTime = extracted.maxTime;
 
   ui.pathCount.textContent = state.timelinePaths.length.toLocaleString();
   ui.rawCount.textContent = state.rawPoints.length.toLocaleString();
   ui.anomalyCount.textContent =
-    `${state.anomalyCases.length.toLocaleString()} cases / ${state.anomalyLegCount.toLocaleString()} legs`;
+    `${state.anomalyCases.length.toLocaleString()} cases / ${state.anomalyLegCount.toLocaleString()} legs / ` +
+    `${state.anomalyPointCount.toLocaleString()} points`;
   ui.stitchCount.textContent = state.inferredStitches.length.toLocaleString();
   ui.applyFilter.disabled = false;
   ui.fullRange.disabled = false;
@@ -2098,7 +2196,8 @@ async function loadData(data, label) {
   updateStatus(
     `Loaded ${label}. Data range: ${new Date(state.minTime).toLocaleString()} – ` +
     `${new Date(state.maxTime).toLocaleString()}. Detected ` +
-    `${state.anomalyCases.length} potential anomaly cases (${state.anomalyLegCount} legs) and ` +
+    `${state.anomalyCases.length} potential anomaly cases (${state.anomalyLegCount} legs, ` +
+    `${state.anomalyPointCount} suspect points) and ` +
     `${state.inferredStitches.length.toLocaleString()} inferred stitches; both hidden by default.`
   );
 }
