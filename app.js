@@ -44,7 +44,7 @@ const state = {
 
 function parseLatLng(value) {
   if (typeof value !== "string") return null;
-  const match = value.match(/(-?\d+(?:\.\d+)?)\D+?,\s*(-?\d+(?:\.\d+)?)/);
+  const match = value.match(/([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*°?\s*,\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*°?/);
   if (!match) return null;
 
   const lat = Number(match[1]);
