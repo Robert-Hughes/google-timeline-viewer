@@ -19,6 +19,10 @@ The repository intentionally does not commit personal Timeline data.
 
 The app automatically tries to load `data/Timeline.json`. If it is absent, use the Timeline JSON file picker.
 
+## Standalone offline page
+
+Run `node build-standalone.js` to produce `google-timeline-viewer-offline.html`. It embeds Leaflet, the viewer CSS, and the viewer JavaScript into one file and uses only the local Timeline JSON file picker; no viewer server is required after the file has been downloaded. OpenStreetMap tiles still require network access unless already cached by the browser.
+
 ## Data handling
 
 All Timeline parsing and filtering happens in the browser. The included server only serves local static files. The app does not upload Timeline data anywhere.

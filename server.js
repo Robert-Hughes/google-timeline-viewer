@@ -15,6 +15,8 @@ const mimeTypes = {
 
 const server = http.createServer((req, res) => {
   const requestPath = decodeURIComponent((req.url || "/").split("?")[0]);
+  const forceDownload = requestPath === "/google-timeline-viewer-offline.html" &&
+    new URL(req.url || "/", "http://localhost").searchParams.get("download") === "1";
   const relativePath = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
   const filePath = path.resolve(root, relativePath);
 
@@ -34,7 +36,10 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, {
       "Content-Type": mimeTypes[path.extname(filePath).toLowerCase()] || "application/octet-stream",
       "Content-Length": stats.size,
-      "Cache-Control": "no-store"
+      "Cache-Control": "no-store",
+      ...(forceDownload ? {
+        "Content-Disposition": 'attachment; filename="google-timeline-viewer-offline.html"'
+      } : {})
     });
     fs.createReadStream(filePath).pipe(res);
   });
