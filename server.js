@@ -4,6 +4,7 @@ const path = require("path");
 
 const root = __dirname;
 const port = Number(process.env.PORT) || 8080;
+const host = process.env.HOST || "127.0.0.1";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -39,6 +40,6 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Google Timeline Viewer: http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`Google Timeline Viewer: http://${host}:${port}`);
 });
