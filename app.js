@@ -1250,7 +1250,7 @@ function expandSegmentsForRendering(segments) {
 }
 
 function buildInferredStitches(timelinePaths, rawPoints) {
-  const MAX_STITCH_GAP_MS = 24 * 60 * 60_000;
+  const MAX_STITCH_GAP_MS = 4 * 24 * 60 * 60_000;
   const observations = [];
 
   for (const path of timelinePaths) {
@@ -1335,13 +1335,13 @@ function detectTimelineAnomalies(timelinePaths, visits) {
     return matches;
   }
 
-  function strongVisitConflict(point) {
+  function strongVisitConflict(point, minVisitProbability = 0.65) {
     for (const visit of overlappingVisits(point.time)) {
       const minutesFromStart = (point.time - visit.start) / 60_000;
       const minutesToEnd = (visit.end - point.time) / 60_000;
       const distanceFromVisitKm = distanceKm(point.latLng, visit.latLng);
 
-      if (visit.probability >= 0.65 &&
+      if (visit.probability >= minVisitProbability &&
           visit.candidateProbability >= 0.80 &&
           minutesFromStart >= 5 &&
           minutesToEnd >= 5 &&
@@ -1431,52 +1431,78 @@ function detectTimelineAnomalies(timelinePaths, visits) {
     .flat()
     .slice()
     .sort((a, b) => a.time - b.time);
+  const visitConflicts = chronologicalPoints.map(
+    point => strongVisitConflict(point, 0.60)
+  );
 
-  for (let index = 1; index + 1 < chronologicalPoints.length; index += 1) {
-    const before = chronologicalPoints[index - 1];
-    const point = chronologicalPoints[index];
-    const after = chronologicalPoints[index + 1];
-    const conflict = strongVisitConflict(point);
-    if (!conflict) continue;
-
-    const distanceInKm = distanceKm(before.latLng, point.latLng);
-    const distanceOutKm = distanceKm(point.latLng, after.latLng);
-    const bypassDistanceKm = distanceKm(before.latLng, after.latLng);
-    const elapsedHours = (after.time - before.time) / 3_600_000;
-
-    if (distanceInKm < 50 ||
-        distanceOutKm < 50 ||
-        bypassDistanceKm > 10 ||
-        elapsedHours <= 0 ||
-        elapsedHours > 36) {
+  for (let index = 0; index < chronologicalPoints.length;) {
+    if (!visitConflicts[index]) {
+      index += 1;
       continue;
     }
 
-    let anomalyCase = anomalyCases.find(
-      candidate =>
-        candidate.semanticSegmentIndex === point.semanticSegmentIndex &&
-        candidate.time === point.time
-    );
-
-    if (!anomalyCase) {
-      anomalyCase = {
-        id: nextCaseId++,
-        rule: "isolated-observation-with-visit-conflict",
-        reason: "Isolated Timeline observation: " + distanceInKm.toFixed(1) +
-          " km from the preceding point and " + distanceOutKm.toFixed(1) +
-          " km from the following point, while those surrounding points are " +
-          bypassDistanceKm.toFixed(1) + " km apart and an overlapping high-confidence " +
-          conflict.visit.semanticType.toLowerCase() + " visit is " +
-          conflict.distanceFromVisitKm.toFixed(1) + " km away.",
-        semanticSegmentIndex: point.semanticSegmentIndex,
-        time: point.time,
-        latLng: point.latLng
-      };
-      anomalyCases.push(anomalyCase);
+    let runEnd = index;
+    while (runEnd + 1 < chronologicalPoints.length &&
+           visitConflicts[runEnd + 1] &&
+           chronologicalPoints[runEnd + 1].time - chronologicalPoints[runEnd].time <=
+             6 * 60 * 60_000 &&
+           distanceKm(
+             chronologicalPoints[runEnd].latLng,
+             chronologicalPoints[runEnd + 1].latLng
+           ) <= 10) {
+      runEnd += 1;
     }
 
-    point.observationAnomaly = anomalyCase;
-    point.excludeFromStitching = true;
+    const before = chronologicalPoints[index - 1];
+    const after = chronologicalPoints[runEnd + 1];
+    if (before && after) {
+      const firstPoint = chronologicalPoints[index];
+      const lastPoint = chronologicalPoints[runEnd];
+      const distanceInKm = distanceKm(before.latLng, firstPoint.latLng);
+      const distanceOutKm = distanceKm(lastPoint.latLng, after.latLng);
+      const bypassDistanceKm = distanceKm(before.latLng, after.latLng);
+      const elapsedHours = (after.time - before.time) / 3_600_000;
+
+      if (distanceInKm >= 50 &&
+          distanceOutKm >= 50 &&
+          bypassDistanceKm <= 10 &&
+          elapsedHours > 0 &&
+          elapsedHours <= 36) {
+        const runPoints = chronologicalPoints.slice(index, runEnd + 1);
+        const existingSegments = new Set(runPoints.map(point => point.semanticSegmentIndex));
+        let anomalyCase = anomalyCases.find(
+          candidate => existingSegments.has(candidate.semanticSegmentIndex)
+        );
+
+        if (!anomalyCase) {
+          const conflict = visitConflicts[index];
+          const observationLabel = runPoints.length === 1
+            ? "Isolated Timeline observation"
+            : "Isolated Timeline observation cluster (" + runPoints.length + " points)";
+          anomalyCase = {
+            id: nextCaseId++,
+            rule: "isolated-observation-cluster-with-visit-conflict",
+            reason: observationLabel + ": " + distanceInKm.toFixed(1) +
+              " km from the preceding point and " + distanceOutKm.toFixed(1) +
+              " km from the following point, while those surrounding points are " +
+              bypassDistanceKm.toFixed(1) + " km apart and an overlapping high-confidence " +
+              conflict.visit.semanticType.toLowerCase() + " visit is " +
+              conflict.distanceFromVisitKm.toFixed(1) + " km away.",
+            semanticSegmentIndex: firstPoint.semanticSegmentIndex,
+            time: firstPoint.time,
+            latLng: firstPoint.latLng
+          };
+          anomalyCases.push(anomalyCase);
+        }
+
+        for (const point of runPoints) {
+          point.observationAnomaly = anomalyCase;
+          point.excludeFromStitching = true;
+        }
+      }
+    }
+
+    index = runEnd + 1;
   }
   return anomalyCases;
 }
@@ -1507,12 +1533,16 @@ function buildRawTraces(points, start, end) {
 function filteredTimelinePaths(start, end, anomalyMode) {
   const traces = [];
   const singletonPoints = [];
-  const anomalySingletonPoints = [];
+  const anomalyPoints = [];
   let visibleCount = 0;
 
   for (const path of state.timelinePaths) {
     const visible = path.filter(point => point.time >= start && point.time <= end);
     visibleCount += visible.length;
+
+    if (anomalyMode === "show" || anomalyMode === "only") {
+      anomalyPoints.push(...visible.filter(point => point.observationAnomaly));
+    }
 
     if (visible.length >= 2) {
       traces.push(visible);
@@ -1521,8 +1551,6 @@ function filteredTimelinePaths(start, end, anomalyMode) {
       if (point.observationAnomaly) {
         if (anomalyMode === "normal") {
           singletonPoints.push(point);
-        } else if (anomalyMode !== "hide") {
-          anomalySingletonPoints.push(point);
         }
       } else if (anomalyMode !== "only") {
         singletonPoints.push(point);
@@ -1530,7 +1558,7 @@ function filteredTimelinePaths(start, end, anomalyMode) {
     }
   }
 
-  return { traces, singletonPoints, anomalySingletonPoints, visibleCount };
+  return { traces, singletonPoints, anomalyPoints, visibleCount };
 }
 
 function pointsToLatLngs(traces) {
@@ -2038,7 +2066,7 @@ function render() {
       : [];
   const visibleAnomalyPoints =
     ui.showPaths.checked && anomalyMode !== "hide" && (!stitchOnly || anomalyOnly)
-      ? pathResult.anomalySingletonPoints
+      ? pathResult.anomalyPoints
       : [];
   for (const point of [...visibleSingletonPoints, ...visibleAnomalyPoints]) {
     bounds.extend(point.latLng);
@@ -2198,7 +2226,8 @@ async function loadData(data, label) {
     `${new Date(state.maxTime).toLocaleString()}. Detected ` +
     `${state.anomalyCases.length} potential anomaly cases (${state.anomalyLegCount} legs, ` +
     `${state.anomalyPointCount} suspect points) and ` +
-    `${state.inferredStitches.length.toLocaleString()} inferred stitches; both hidden by default.`
+    `${state.inferredStitches.length.toLocaleString()} inferred stitches; anomalies are hidden and ` +
+    `stitches are treated as normal by default.`
   );
 }
 
