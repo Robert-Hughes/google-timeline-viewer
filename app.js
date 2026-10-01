@@ -99,6 +99,17 @@ function parseFilterDateTime(value, endOfDay = false) {
     nov: 10, november: 10, dec: 11, december: 11
   };
 
+  // Fixed-offset timezone abbreviations accepted as suffixes on filter input.
+  // These are deliberately explicit rather than left to browser-dependent Date.parse.
+  const timezoneOffsets = {
+    utc: 0, gmt: 0,
+    wet: 0, west: 60,
+    bst: 60, cet: 60, cest: 120, eet: 120, eest: 180,
+    est: -300, edt: -240, cst: -360, cdt: -300,
+    mst: -420, mdt: -360, pst: -480, pdt: -420
+  };
+  let timezoneOffsetMinutes = null;
+
   function fullYear(year) {
     if (year >= 100) return year;
     return year < 70 ? 2000 + year : 1900 + year;
@@ -168,13 +179,33 @@ function parseFilterDateTime(value, endOfDay = false) {
 
   function makeLocal(year, month, day, clockText, defaultEnd = endOfDay) {
     const resolvedYear = fullYear(Number(year));
+    const numericDay = Number(day);
     const clock = parseClock(clockText, defaultEnd);
-    if (!clock || month < 0 || month > 11 || day < 1 || day > 31) return null;
+    if (!clock || month < 0 || month > 11 || numericDay < 1 || numericDay > 31) return null;
+
+    if (timezoneOffsetMinutes !== null) {
+      const utcWallTime = Date.UTC(
+        resolvedYear,
+        month,
+        numericDay,
+        clock.hour,
+        clock.minute,
+        clock.second,
+        clock.millisecond
+      );
+      const wallDate = new Date(utcWallTime);
+      if (wallDate.getUTCFullYear() !== resolvedYear ||
+          wallDate.getUTCMonth() !== month ||
+          wallDate.getUTCDate() !== numericDay) {
+        return null;
+      }
+      return utcWallTime - timezoneOffsetMinutes * 60 * 1000;
+    }
 
     const date = new Date(
       resolvedYear,
       month,
-      Number(day),
+      numericDay,
       clock.hour,
       clock.minute,
       clock.second,
@@ -183,7 +214,7 @@ function parseFilterDateTime(value, endOfDay = false) {
 
     if (date.getFullYear() !== resolvedYear ||
         date.getMonth() !== month ||
-        date.getDate() !== Number(day)) {
+        date.getDate() !== numericDay) {
       return null;
     }
     return date.getTime();
@@ -205,6 +236,15 @@ function parseFilterDateTime(value, endOfDay = false) {
   if (/(?:z|[+-]\d{2}:?\d{2})$/i.test(text)) {
     const explicitZone = Date.parse(text);
     if (Number.isFinite(explicitZone)) return explicitZone;
+  }
+
+  const timezoneMatch = text.match(/\s+([a-z]{2,5})$/i);
+  if (timezoneMatch) {
+    const abbreviation = timezoneMatch[1].toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(timezoneOffsets, abbreviation)) {
+      timezoneOffsetMinutes = timezoneOffsets[abbreviation];
+      text = text.slice(0, timezoneMatch.index).trim();
+    }
   }
 
   text = text
@@ -232,7 +272,7 @@ function parseFilterDateTime(value, endOfDay = false) {
 
   const datePatterns = [
     {
-      re: /\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/i,
+      re: /\b(\d{4})[-/.:](\d{1,2})[-/.:](\d{1,2})\b/i,
       parts: match => [match[1], Number(match[2]) - 1, match[3]]
     },
     {
