@@ -2385,10 +2385,11 @@ function setPlaybackUiActive(active) {
   ui.fullRange.disabled = active || state.minTime === null;
 }
 
-function playbackTick(now) {
+function playbackTick() {
   state.playbackFrame = null;
   if (!state.playbackActive || state.playbackPaused) return;
 
+  const now = performance.now();
   if (state.playbackLastFrameAt === null) state.playbackLastFrameAt = now;
   const elapsed = Math.max(0, now - state.playbackLastFrameAt);
   state.playbackLastFrameAt = now;
@@ -2402,7 +2403,7 @@ function playbackTick(now) {
   }
 
   updatePlaybackPosition(nextTime);
-  state.playbackFrame = requestAnimationFrame(playbackTick);
+  state.playbackFrame = setTimeout(playbackTick, 16);
 }
 
 function startPlayback() {
@@ -2438,12 +2439,12 @@ function startPlayback() {
   updateStatus(
     `Playback: ${new Date(start).toLocaleString()} – ${new Date(end).toLocaleString()}.`
   );
-  state.playbackFrame = requestAnimationFrame(playbackTick);
+  state.playbackFrame = setTimeout(playbackTick, 16);
 }
 
 function exitPlayback(renderAfter = true) {
   if (state.playbackFrame !== null) {
-    cancelAnimationFrame(state.playbackFrame);
+    clearTimeout(state.playbackFrame);
     state.playbackFrame = null;
   }
   if (state.playbackMarker && map.hasLayer(state.playbackMarker)) {
@@ -2473,12 +2474,12 @@ function togglePlayback() {
     state.playbackPaused = false;
     state.playbackLastFrameAt = null;
     ui.togglePlayback.textContent = "Pause";
-    state.playbackFrame = requestAnimationFrame(playbackTick);
+    state.playbackFrame = setTimeout(playbackTick, 16);
   } else {
     state.playbackPaused = true;
     ui.togglePlayback.textContent = "Resume";
     if (state.playbackFrame !== null) {
-      cancelAnimationFrame(state.playbackFrame);
+      clearTimeout(state.playbackFrame);
       state.playbackFrame = null;
     }
   }
