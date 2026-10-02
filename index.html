@@ -38,6 +38,23 @@
         <button id="full-range" type="button" disabled>Full range</button>
       </div>
 
+      <button id="start-playback" type="button" disabled>▶ Play</button>
+      <section id="playback-panel" class="playback-panel" hidden aria-label="Playback controls">
+        <div class="playback-heading">
+          <strong>Playback</strong>
+          <span id="playback-time">–</span>
+        </div>
+        <input id="playback-scrubber" class="playback-scrubber" type="range"
+               min="0" max="100000" step="1" value="0" aria-label="Playback position">
+        <label class="playback-speed">
+          Speed <span id="playback-speed-value">4,096×</span>
+          <input id="playback-speed" type="range" min="0" max="20" step="0.25" value="12">
+        </label>
+        <div class="button-row playback-buttons">
+          <button id="toggle-playback" type="button">Pause</button>
+          <button id="stop-playback" type="button">Stop</button>
+        </div>
+      </section>
       <fieldset>
         <legend>Layers</legend>
         <label class="checkbox"><input id="show-paths" type="checkbox" checked> Timeline paths</label>

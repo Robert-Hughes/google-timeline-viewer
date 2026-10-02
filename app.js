@@ -20,6 +20,14 @@ const ui = {
   endTimeParsed: document.getElementById("end-time-parsed"),
   applyFilter: document.getElementById("apply-filter"),
   fullRange: document.getElementById("full-range"),
+  startPlayback: document.getElementById("start-playback"),
+  playbackPanel: document.getElementById("playback-panel"),
+  playbackTime: document.getElementById("playback-time"),
+  playbackScrubber: document.getElementById("playback-scrubber"),
+  playbackSpeed: document.getElementById("playback-speed"),
+  playbackSpeedValue: document.getElementById("playback-speed-value"),
+  togglePlayback: document.getElementById("toggle-playback"),
+  stopPlayback: document.getElementById("stop-playback"),
   fitTraces: document.getElementById("fit-traces"),
   showPaths: document.getElementById("show-paths"),
   showRaw: document.getElementById("show-raw"),
@@ -58,7 +66,18 @@ const state = {
   hoverFrame: null,
   pendingMouseEvent: null,
   contextMenu: null,
-  contextLatLng: null
+  contextLatLng: null,
+  playbackActive: false,
+  playbackPaused: false,
+  playbackStart: null,
+  playbackEnd: null,
+  playbackTime: null,
+  playbackLastFrameAt: null,
+  playbackFrame: null,
+  playbackMarker: null,
+  playbackTimelineSegments: [],
+  playbackRawSegments: [],
+  playbackObservations: []
 };
 
 function parseLatLng(value) {
@@ -2207,6 +2226,277 @@ function render() {
   schedulePaintMeasurement("render to 2nd animation frame", renderStartedAt);
 }
 
+function playbackSpeedMultiplier() {
+  return 2 ** Number(ui.playbackSpeed.value);
+}
+
+function formatPlaybackSpeed(speed) {
+  if (speed < 1000) return `${speed.toLocaleString(undefined, { maximumFractionDigits: 2 })}×`;
+  return `${Math.round(speed).toLocaleString()}×`;
+}
+
+function buildPlaybackTrack(start, end) {
+  const timelineSegments = [];
+  const observations = [];
+
+  for (const path of state.timelinePaths) {
+    for (const point of path) {
+      if (point.time >= start && point.time <= end) observations.push(point);
+    }
+    for (let i = 1; i < path.length; i += 1) {
+      const a = path[i - 1];
+      const b = path[i];
+      if (b.time < start || a.time > end || b.time <= a.time) continue;
+      timelineSegments.push({ a, b });
+    }
+  }
+
+  for (const stitch of state.inferredStitches) {
+    if (stitch.b.time < start || stitch.a.time > end || stitch.b.time <= stitch.a.time) continue;
+    timelineSegments.push({ a: stitch.a, b: stitch.b });
+  }
+
+  const rawResult = buildRawTraces(state.rawPoints, start, end);
+  const rawSegments = [];
+  for (const trace of rawResult.traces) {
+    for (let i = 1; i < trace.length; i += 1) {
+      if (trace[i].time > trace[i - 1].time) {
+        rawSegments.push({ a: trace[i - 1], b: trace[i] });
+      }
+    }
+  }
+
+  for (const point of state.rawPoints) {
+    if (point.time >= start && point.time <= end) observations.push(point);
+  }
+
+  timelineSegments.sort((a, b) => a.a.time - b.a.time);
+  rawSegments.sort((a, b) => a.a.time - b.a.time);
+  for (const segments of [timelineSegments, rawSegments]) {
+    let maxEndThrough = -Infinity;
+    for (const segment of segments) {
+      maxEndThrough = Math.max(maxEndThrough, segment.b.time);
+      segment.maxEndThrough = maxEndThrough;
+    }
+  }
+  observations.sort((a, b) => a.time - b.time);
+
+  state.playbackTimelineSegments = timelineSegments;
+  state.playbackRawSegments = rawSegments;
+  state.playbackObservations = observations;
+}
+
+function findPlaybackSegment(segments, time) {
+  let low = 0;
+  let high = segments.length - 1;
+  let candidate = -1;
+
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    if (segments[middle].a.time <= time) {
+      candidate = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  for (let index = candidate; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (time <= segment.b.time) return segment;
+    if (index === 0 || segments[index - 1].maxEndThrough < time) break;
+  }
+  return null;
+}
+
+function playbackLocationAt(time) {
+  const segment =
+    findPlaybackSegment(state.playbackTimelineSegments, time) ??
+    findPlaybackSegment(state.playbackRawSegments, time);
+
+  if (segment) {
+    const duration = segment.b.time - segment.a.time;
+    const fraction = duration > 0 ? (time - segment.a.time) / duration : 0;
+    return interpolateGreatCircle(
+      segment.a.latLng,
+      segment.b.latLng,
+      Math.max(0, Math.min(1, fraction))
+    );
+  }
+
+  const points = state.playbackObservations;
+  if (!points.length) return null;
+
+  let low = 0;
+  let high = points.length - 1;
+  let previous = -1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    if (points[middle].time <= time) {
+      previous = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  return points[Math.max(0, previous)].latLng;
+}
+
+function ensurePlaybackMarker() {
+  if (!state.playbackMarker) {
+    const icon = L.divIcon({
+      className: "playback-location-icon",
+      html: '<div class="playback-location-dot" aria-hidden="true"></div>',
+      iconSize: [20, 20],
+      iconAnchor: [10, 10]
+    });
+    state.playbackMarker = L.marker([0, 0], {
+      icon,
+      interactive: false,
+      keyboard: false,
+      zIndexOffset: 1000
+    });
+  }
+  return state.playbackMarker;
+}
+
+function updatePlaybackPosition(time) {
+  state.playbackTime = Math.max(state.playbackStart, Math.min(state.playbackEnd, time));
+  const span = state.playbackEnd - state.playbackStart;
+  const fraction = span > 0 ? (state.playbackTime - state.playbackStart) / span : 0;
+  ui.playbackScrubber.value = String(Math.round(fraction * Number(ui.playbackScrubber.max)));
+  ui.playbackTime.textContent = new Date(state.playbackTime).toLocaleString();
+
+  const latLng = playbackLocationAt(state.playbackTime);
+  if (!latLng) return;
+
+  const marker = ensurePlaybackMarker();
+  marker.setLatLng(latLng);
+  if (!map.hasLayer(marker)) marker.addTo(map);
+}
+
+function setPlaybackUiActive(active) {
+  ui.playbackPanel.hidden = !active;
+  ui.startPlayback.hidden = active;
+  ui.startTime.disabled = active;
+  ui.endTime.disabled = active;
+  ui.applyFilter.disabled = active || state.minTime === null;
+  ui.fullRange.disabled = active || state.minTime === null;
+}
+
+function playbackTick(now) {
+  state.playbackFrame = null;
+  if (!state.playbackActive || state.playbackPaused) return;
+
+  if (state.playbackLastFrameAt === null) state.playbackLastFrameAt = now;
+  const elapsed = Math.max(0, now - state.playbackLastFrameAt);
+  state.playbackLastFrameAt = now;
+
+  const nextTime = state.playbackTime + elapsed * playbackSpeedMultiplier();
+  if (nextTime >= state.playbackEnd) {
+    updatePlaybackPosition(state.playbackEnd);
+    state.playbackPaused = true;
+    ui.togglePlayback.textContent = "Replay";
+    return;
+  }
+
+  updatePlaybackPosition(nextTime);
+  state.playbackFrame = requestAnimationFrame(playbackTick);
+}
+
+function startPlayback() {
+  if (state.minTime === null) return;
+
+  const parsedRange = updateAllDateTimeParseFeedback();
+  const start = parsedRange.start;
+  const end = parsedRange.end;
+  if (start === null || end === null) {
+    updateStatus("Could not parse the start or end date/time for playback.");
+    return;
+  }
+  if (start >= end) {
+    updateStatus("Playback needs a start date/time before the end date/time.");
+    return;
+  }
+
+  render();
+  buildPlaybackTrack(start, end);
+  if (!state.playbackObservations.length) {
+    updateStatus("No timestamped locations are available in the selected playback period.");
+    return;
+  }
+
+  state.playbackActive = true;
+  state.playbackPaused = false;
+  state.playbackStart = start;
+  state.playbackEnd = end;
+  state.playbackLastFrameAt = null;
+  ui.togglePlayback.textContent = "Pause";
+  setPlaybackUiActive(true);
+  updatePlaybackPosition(start);
+  updateStatus(
+    `Playback: ${new Date(start).toLocaleString()} – ${new Date(end).toLocaleString()}.`
+  );
+  state.playbackFrame = requestAnimationFrame(playbackTick);
+}
+
+function exitPlayback(renderAfter = true) {
+  if (state.playbackFrame !== null) {
+    cancelAnimationFrame(state.playbackFrame);
+    state.playbackFrame = null;
+  }
+  if (state.playbackMarker && map.hasLayer(state.playbackMarker)) {
+    map.removeLayer(state.playbackMarker);
+  }
+
+  state.playbackActive = false;
+  state.playbackPaused = false;
+  state.playbackStart = null;
+  state.playbackEnd = null;
+  state.playbackTime = null;
+  state.playbackLastFrameAt = null;
+  state.playbackTimelineSegments = [];
+  state.playbackRawSegments = [];
+  state.playbackObservations = [];
+  setPlaybackUiActive(false);
+  if (renderAfter) render();
+}
+
+function togglePlayback() {
+  if (!state.playbackActive) return;
+
+  if (state.playbackPaused) {
+    if (state.playbackTime >= state.playbackEnd) {
+      updatePlaybackPosition(state.playbackStart);
+    }
+    state.playbackPaused = false;
+    state.playbackLastFrameAt = null;
+    ui.togglePlayback.textContent = "Pause";
+    state.playbackFrame = requestAnimationFrame(playbackTick);
+  } else {
+    state.playbackPaused = true;
+    ui.togglePlayback.textContent = "Resume";
+    if (state.playbackFrame !== null) {
+      cancelAnimationFrame(state.playbackFrame);
+      state.playbackFrame = null;
+    }
+  }
+}
+
+function scrubPlayback() {
+  if (!state.playbackActive) return;
+  const fraction = Number(ui.playbackScrubber.value) / Number(ui.playbackScrubber.max);
+  updatePlaybackPosition(
+    state.playbackStart + fraction * (state.playbackEnd - state.playbackStart)
+  );
+  state.playbackLastFrameAt = null;
+}
+
+function updatePlaybackSpeedLabel() {
+  ui.playbackSpeedValue.textContent = formatPlaybackSpeed(playbackSpeedMultiplier());
+}
+
 function fitVisible() {
   if (state.visibleBounds) {
     map.fitBounds(state.visibleBounds, { padding: [24, 24], maxZoom: 16 });
@@ -2224,6 +2514,7 @@ function setFullRange(renderNow = true) {
 }
 
 async function loadData(data, label) {
+  if (state.playbackActive) exitPlayback(false);
   updateStatus(`Parsing ${label}…`);
   await new Promise(resolve => setTimeout(resolve, 0));
 
@@ -2252,6 +2543,7 @@ async function loadData(data, label) {
   ui.stitchCount.textContent = state.inferredStitches.length.toLocaleString();
   ui.applyFilter.disabled = false;
   ui.fullRange.disabled = false;
+  ui.startPlayback.disabled = false;
   ui.fitTraces.disabled = false;
 
   setFullRange(false);
@@ -2319,6 +2611,11 @@ ui.fileInput.addEventListener("change", async event => {
 
 ui.loadDefault.addEventListener("click", loadDefaultData);
 ui.applyFilter.addEventListener("click", render);
+ui.startPlayback.addEventListener("click", startPlayback);
+ui.togglePlayback.addEventListener("click", togglePlayback);
+ui.stopPlayback.addEventListener("click", exitPlayback);
+ui.playbackScrubber.addEventListener("input", scrubPlayback);
+ui.playbackSpeed.addEventListener("input", updatePlaybackSpeedLabel);
 for (const [input, output, endOfDay] of [
   [ui.startTime, ui.startTimeParsed, false],
   [ui.endTime, ui.endTimeParsed, true]

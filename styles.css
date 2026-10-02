@@ -116,6 +116,79 @@ button:disabled {
   margin-top: 10px;
 }
 
+#start-playback {
+  margin-top: 10px;
+}
+
+.playback-panel {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.playback-panel[hidden] {
+  display: none;
+}
+
+.playback-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.playback-heading span {
+  color: #4b5563;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.playback-scrubber,
+.playback-speed input[type="range"] {
+  width: 100%;
+}
+
+.playback-scrubber {
+  margin: 2px 0 10px;
+}
+
+.playback-speed {
+  display: block;
+  font-weight: 400;
+}
+
+.playback-speed span {
+  float: right;
+  color: #4b5563;
+  font-variant-numeric: tabular-nums;
+}
+
+.playback-speed input[type="range"] {
+  margin-top: 6px;
+}
+
+.playback-buttons {
+  margin-top: 10px;
+}
+
+.playback-location-icon {
+  background: transparent;
+  border: 0;
+}
+
+.playback-location-dot {
+  width: 20px;
+  height: 20px;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: #2563eb;
+  box-shadow: 0 1px 5px rgb(0 0 0 / 45%), 0 0 0 5px rgb(37 99 235 / 22%);
+}
+
 fieldset {
   margin: 18px 0;
   padding: 10px 12px;
